@@ -1,0 +1,11 @@
+[daemon]
+port = 7700
+log_level = "info"
+
+[[profiles]]
+name = "Music"
+source = "/home/user/Music"
+mode = "mirror"
+
+[profiles.destinations]
+local = "/home/user/Music-sync"
