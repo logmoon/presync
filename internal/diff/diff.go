@@ -60,6 +60,19 @@ func BuildManifest(root string) (Manifest, error) {
 			return nil
 		}
 
+		// Skip symlinks: a symlink-to-dir would otherwise be recorded as a
+		// regular file and fail during transfer (EISDIR). A symlink-to-file
+		// would be re-transferred on every sync (its size is the link target
+		// path length). Neither is a file we can sync meaningfully.
+		if d.Type()&os.ModeSymlink != 0 {
+			return nil
+		}
+
+		// Skip transfer staging files — they are never part of the real tree.
+		if filepath.Ext(path) == ".presync-tmp" {
+			return nil
+		}
+
 		info, err := d.Info()
 		if err != nil {
 			return fmt.Errorf("stating file %s: %w", path, err)
@@ -132,6 +145,17 @@ func ComputeDelta(src, dst Manifest, mode string) Delta {
 		}
 
 		if srcFile.Size != dstFile.Size || srcFile.ModTime != dstFile.ModTime {
+			delta.ToUpdate = append(delta.ToUpdate, FileAction{
+				Path:   srcFile.Path,
+				Reason: "update",
+			})
+			continue
+		}
+
+		// Size + mtime match, but both sides carry hashes: compare content.
+		// This is the SHA-256 fallback for files whose metadata cannot
+		// distinguish a change (same size, same-second mtime).
+		if srcFile.SHA256 != "" && dstFile.SHA256 != "" && srcFile.SHA256 != dstFile.SHA256 {
 			delta.ToUpdate = append(delta.ToUpdate, FileAction{
 				Path:   srcFile.Path,
 				Reason: "update",

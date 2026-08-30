@@ -101,6 +101,73 @@ func TestComputeDelta_FilesIdentical(t *testing.T) {
 	}
 }
 
+func TestComputeDelta_HashFallback(t *testing.T) {
+	// Same size + same mtime, but both manifests carry hashes: the hash
+	// comparison is the fallback that catches silently-changed content.
+	src := Manifest{Files: []FileEntry{{Path: "e.txt", Size: 100, ModTime: 1000, SHA256: "aaaa"}}}
+	dst := Manifest{Files: []FileEntry{{Path: "e.txt", Size: 100, ModTime: 1000, SHA256: "bbbb"}}}
+
+	delta := ComputeDelta(src, dst, "mirror")
+
+	if len(delta.ToUpdate) != 1 {
+		t.Fatalf("expected 1 update from hash mismatch, got %d", len(delta.ToUpdate))
+	}
+	if delta.ToUpdate[0].Path != "e.txt" {
+		t.Errorf("expected update for e.txt, got %q", delta.ToUpdate[0].Path)
+	}
+
+	// Matching hashes: no update
+	src2 := Manifest{Files: []FileEntry{{Path: "e.txt", Size: 100, ModTime: 1000, SHA256: "aaaa"}}}
+	dst2 := Manifest{Files: []FileEntry{{Path: "e.txt", Size: 100, ModTime: 1000, SHA256: "aaaa"}}}
+	delta2 := ComputeDelta(src2, dst2, "mirror")
+	if len(delta2.ToUpdate) != 0 {
+		t.Errorf("expected 0 updates for matching hashes, got %d", len(delta2.ToUpdate))
+	}
+
+	// Hash on only one side: metadata comparison governs (no fallback)
+	src3 := Manifest{Files: []FileEntry{{Path: "e.txt", Size: 100, ModTime: 1000, SHA256: "aaaa"}}}
+	dst3 := Manifest{Files: []FileEntry{{Path: "e.txt", Size: 100, ModTime: 1000}}}
+	delta3 := ComputeDelta(src3, dst3, "mirror")
+	if len(delta3.ToUpdate) != 0 {
+		t.Errorf("expected 0 updates when only one side has a hash, got %d", len(delta3.ToUpdate))
+	}
+}
+
+func TestBuildManifest_SkipsSymlinksAndTempFiles(t *testing.T) {
+	root := t.TempDir()
+
+	if err := os.WriteFile(filepath.Join(root, "real.txt"), []byte("real"), 0o644); err != nil {
+		t.Fatalf("writing real file: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "leftover.presync-tmp"), []byte("partial"), 0o644); err != nil {
+		t.Fatalf("writing temp file: %v", err)
+	}
+
+	// Symlink to a file and a symlink to a directory must both be skipped
+	if err := os.Symlink("real.txt", filepath.Join(root, "link.txt")); err != nil {
+		t.Skipf("symlinks not supported: %v", err)
+	}
+	sub := filepath.Join(root, "subdir")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatalf("creating subdir: %v", err)
+	}
+	if err := os.Symlink(sub, filepath.Join(root, "dirlink")); err != nil {
+		t.Fatalf("creating dir symlink: %v", err)
+	}
+
+	manifest, err := BuildManifest(root)
+	if err != nil {
+		t.Fatalf("BuildManifest: %v", err)
+	}
+
+	if len(manifest.Files) != 1 {
+		t.Fatalf("expected exactly 1 file (real.txt), got %d: %+v", len(manifest.Files), manifest.Files)
+	}
+	if manifest.Files[0].Path != "real.txt" {
+		t.Errorf("expected real.txt, got %q", manifest.Files[0].Path)
+	}
+}
+
 func TestComputeDelta_MixedActions(t *testing.T) {
 	src := Manifest{Files: []FileEntry{
 		{Path: "add.txt", Size: 10, ModTime: 100},

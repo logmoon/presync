@@ -124,6 +124,51 @@ class SafBridge(
     }
 
     @JavascriptInterface
+    fun deleteFile(path: String, callback: String) {
+        if (!isTrustedPage()) {
+            invokeCallback(callback, false, "Untrusted page")
+            return
+        }
+        try {
+            val treeUri = getDestinationUri() ?: run {
+                invokeCallback(callback, false, "No destination folder selected")
+                return
+            }
+
+            val documentFile = DocumentFile.fromTreeUri(activity, treeUri)
+                ?: run {
+                    invokeCallback(callback, false, "Cannot access destination folder")
+                    return
+                }
+
+            val parts = path.split("/")
+            var currentDir = documentFile
+            for (i in 0 until parts.size - 1) {
+                currentDir = currentDir.findFile(parts[i])
+                    ?: run {
+                        // Parent missing — the file is already gone
+                        invokeCallback(callback, true, "OK")
+                        return
+                    }
+            }
+
+            val target = currentDir.findFile(parts.last())
+            if (target == null || !target.exists()) {
+                invokeCallback(callback, true, "OK")
+                return
+            }
+            if (!target.delete()) {
+                invokeCallback(callback, false, "Failed to delete: ${parts.last()}")
+                return
+            }
+
+            invokeCallback(callback, true, "OK")
+        } catch (e: Exception) {
+            invokeCallback(callback, false, e.message ?: "Unknown error")
+        }
+    }
+
+    @JavascriptInterface
     fun saveServerUrl(url: String) {
         if (!isTrustedPage()) return
         (activity as? MainActivity)?.saveServerUrl(url)

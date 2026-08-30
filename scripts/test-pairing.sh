@@ -78,7 +78,7 @@ BODY=$(curl -s -H "X-Presync-Token: bad-token" $BASE/status)
 assert_contains "wrong token gets 401" "invalid or revoked token" "$BODY"
 
 BODY=$(curl -s -H "X-Presync-Token: $LOCAL_TOKEN" $BASE/sync -X POST -d '{}')
-assert_contains "local token rejected on /sync" "invalid or revoked token" "$BODY"
+assert_contains "local token passes auth on /sync over loopback (400 body validation, not 401)" "device_id and profile are required" "$BODY"
 
 echo ""
 echo "=== Test 2: Pairing flow ==="

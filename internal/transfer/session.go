@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -24,7 +25,7 @@ const (
 const (
 	MaxRetries           = 3
 	staleSessionAge      = 7 * 24 * time.Hour
-	activeSessionTimeout = 60 * time.Second
+	activeSessionTimeout = 30 * time.Minute
 )
 
 type FileSession struct {
@@ -74,9 +75,18 @@ func NewSession(deviceID, profile string, filePaths []string) *Session {
 }
 
 func sessionPath(deviceID, profile string) string {
-	ts := time.Now().UTC().Format("20060102T150405Z")
-	name := fmt.Sprintf("%s-%s-%s.json", deviceID, profile, ts)
+	// Nanosecond timestamp + sanitized identifiers: two sessions for the same
+	// device+profile can never collide, and the identifiers can never escape
+	// the sessions directory.
+	ts := time.Now().UTC().Format("20060102T150405.000000000Z")
+	name := fmt.Sprintf("%s-%s-%s.json", sanitizeName(deviceID), sanitizeName(profile), ts)
 	return filepath.Join(config.SessionsDir(), name)
+}
+
+func sanitizeName(s string) string {
+	s = strings.ReplaceAll(s, "/", "_")
+	s = strings.ReplaceAll(s, "\\", "_")
+	return s
 }
 
 // ResolveSession maps a client-supplied session identifier to a path strictly
@@ -205,7 +215,9 @@ func (s *Session) PendingFiles() []FileSession {
 
 	var result []FileSession
 	for _, f := range s.Files {
-		if f.State == FilePending {
+		// in_progress files are still work remaining — a resume log that shows
+		// "pending=0" while a file is mid-transfer is misleading.
+		if f.State == FilePending || f.State == FileInProgress {
 			result = append(result, f)
 		}
 	}

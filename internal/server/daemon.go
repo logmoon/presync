@@ -303,6 +303,7 @@ func newServer(cfg *config.Config) *http.Server {
 	mux.HandleFunc("/sync", withAuth(handleSyncStart()))
 	mux.HandleFunc("/sync/file", withAuth(handleSyncFile()))
 	mux.HandleFunc("/sync/confirm", withAuth(handleSyncConfirm()))
+	mux.HandleFunc("/sync/error", withAuth(handleSyncError()))
 	mux.HandleFunc("/sync/status", withAuth(handleSyncStatus()))
 	mux.HandleFunc("/sync/complete", withAuth(handleSyncComplete()))
 

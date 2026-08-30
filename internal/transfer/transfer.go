@@ -61,6 +61,42 @@ func SendFile(w http.ResponseWriter, path string, offset int64) (string, error) 
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
+// StreamFile writes the file from offset without computing a hash. The caller
+// must have already hashed the file (pass 1); this is pass 2, so the file is
+// only read twice, never hashed twice. Returns an error if the offset exceeds
+// the file size (the prefix skip hits EOF before offset bytes).
+func StreamFile(w http.ResponseWriter, path string, offset int64) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("opening file for send: %w", err)
+	}
+	defer f.Close()
+
+	if offset > 0 {
+		if _, err := io.CopyN(io.Discard, f, offset); err != nil {
+			return fmt.Errorf("skipping prefix for resume (offset %d): %w", offset, err)
+		}
+	}
+
+	buf := make([]byte, ChunkSize)
+	for {
+		n, readErr := f.Read(buf)
+		if n > 0 {
+			if _, writeErr := w.Write(buf[:n]); writeErr != nil {
+				return fmt.Errorf("writing chunk: %w", writeErr)
+			}
+		}
+		if readErr == io.EOF {
+			break
+		}
+		if readErr != nil {
+			return fmt.Errorf("reading file: %w", readErr)
+		}
+	}
+
+	return nil
+}
+
 func ReceiveFile(r *http.Request, destPath string) (string, int64, error) {
 	tmpPath := destPath + ".presync-tmp"
 

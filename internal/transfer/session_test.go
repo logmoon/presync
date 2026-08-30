@@ -111,12 +111,16 @@ func TestSessionPendingFiles(t *testing.T) {
 	s.MarkInProgress("a.mp3")
 	s.MarkDone("b.mp3", "hash")
 
+	// in_progress files are still work remaining and must be counted.
 	pending = s.PendingFiles()
-	if len(pending) != 1 {
-		t.Errorf("expected 1 pending, got %d", len(pending))
+	if len(pending) != 2 {
+		t.Errorf("expected 2 pending (incl. in_progress), got %d", len(pending))
 	}
-	if pending[0].Path != "c.mp3" {
-		t.Errorf("expected c.mp3 pending, got %q", pending[0].Path)
+	if pending[0].Path != "a.mp3" {
+		t.Errorf("expected a.mp3 first, got %q", pending[0].Path)
+	}
+	if pending[1].Path != "c.mp3" {
+		t.Errorf("expected c.mp3 second, got %q", pending[1].Path)
 	}
 }
 

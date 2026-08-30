@@ -243,10 +243,6 @@ func runConnect() error {
 		}
 	}
 
-	if pairingURL == "" && fresh {
-		return fmt.Errorf("--fresh can only be used with a pairing URL")
-	}
-
 	return client.Connect(pairingURL, destDir, fresh, progress)
 }
 

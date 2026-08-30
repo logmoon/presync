@@ -48,22 +48,36 @@ func fileHash(t *testing.T, path string) string {
 }
 
 type mockSyncSession struct {
-	files   []mockFile
-	confirm map[string]bool
+	files       []mockFile
+	confirm     map[string]bool
+	fetched     map[string]int
+	failFetches map[string]int
 }
 
 type mockFile struct {
 	path string
 	data []byte
 	hash string
+	// sessionHash is what /sync returns in the file's sha256 field. Empty
+	// means "pending, must be fetched" (matching the real server: done files
+	// carry their hash on resume, pending ones do not).
+	sessionHash string
 }
 
 func newMockServer(t *testing.T, token string, sourceDir string, files []mockFile) *httptest.Server {
 	t.Helper()
+	srv, _ := newMockServerWithFailures(t, token, sourceDir, files, nil)
+	return srv
+}
+
+func newMockServerWithFailures(t *testing.T, token string, sourceDir string, files []mockFile, failFetches map[string]int) (*httptest.Server, *mockSyncSession) {
+	t.Helper()
 
 	session := &mockSyncSession{
-		files:   files,
-		confirm: make(map[string]bool),
+		files:       files,
+		confirm:     make(map[string]bool),
+		fetched:     make(map[string]int),
+		failFetches: failFetches,
 	}
 
 	mux := http.NewServeMux()
@@ -97,10 +111,14 @@ func newMockServer(t *testing.T, token string, sourceDir string, files []mockFil
 
 		resp := syncResp{Session: "test-session"}
 		for _, f := range session.files {
+			sh := f.sessionHash
+			if sh == "" && f.hash != "" {
+				sh = f.hash
+			}
 			resp.Files = append(resp.Files, fileInfo{
 				Path:   f.path,
 				Size:   int64(len(f.data)),
-				SHA256: f.hash,
+				SHA256: sh,
 			})
 		}
 
@@ -117,6 +135,12 @@ func newMockServer(t *testing.T, token string, sourceDir string, files []mockFil
 		path := r.URL.Query().Get("path")
 		for _, f := range session.files {
 			if f.path == path {
+				session.fetched[path]++
+				if session.failFetches[path] > 0 {
+					session.failFetches[path]--
+					http.Error(w, `{"error":"transient failure"}`, http.StatusInternalServerError)
+					return
+				}
 				w.Header().Set("Content-Type", "application/octet-stream")
 				w.Header().Set("X-Presync-SHA256", f.hash)
 				w.Write(f.data)
@@ -174,7 +198,7 @@ func newMockServer(t *testing.T, token string, sourceDir string, files []mockFil
 		json.NewEncoder(w).Encode(completeResp{OK: true})
 	})
 
-	return httptest.NewServer(mux)
+	return httptest.NewServer(mux), session
 }
 
 func TestSyncProfile_Success(t *testing.T) {
@@ -458,6 +482,110 @@ func TestSyncProfile_AllFail(t *testing.T) {
 
 	if err != nil {
 		t.Fatalf("SyncProfile should not return error for individual file failures: %v", err)
+	}
+
+	if result.FilesSynced != 0 {
+		t.Errorf("expected 0 files synced, got %d", result.FilesSynced)
+	}
+	if result.Errors != 1 {
+		t.Errorf("expected 1 error, got %d", result.Errors)
+	}
+}
+
+func TestSyncProfile_ResumeSkipsDoneFiles(t *testing.T) {
+	sourceDir, destDir := setupTestFiles(t)
+	token := "test-token-123"
+
+	helloData := []byte("hello world")
+	helloHash := fileHash(t, filepath.Join(sourceDir, "hello.txt"))
+	pendingData := []byte("package main")
+	pendingHash := fileHash(t, filepath.Join(sourceDir, "nested/a.go"))
+
+	// Simulate a resumed session: hello.txt is done (hash set, file already on
+	// disk), nested/a.go is pending (no session hash).
+	files := []mockFile{
+		{path: "hello.txt", data: helloData, hash: helloHash, sessionHash: helloHash},
+		{path: "nested/a.go", data: pendingData, hash: pendingHash, sessionHash: ""},
+	}
+
+	if err := os.MkdirAll(filepath.Join(destDir, "nested"), 0o755); err != nil {
+		t.Fatalf("creating dest dirs: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(destDir, "hello.txt"), helloData, 0o644); err != nil {
+		t.Fatalf("pre-placing done file: %v", err)
+	}
+
+	srv, session := newMockServerWithFailures(t, token, sourceDir, files, nil)
+	defer srv.Close()
+
+	result, err := SyncProfile(srv.URL, token, "test-profile", "device-1", destDir, false, nil)
+	if err != nil {
+		t.Fatalf("SyncProfile: %v", err)
+	}
+
+	if result.FilesSynced != 2 {
+		t.Errorf("expected 2 files synced (verified + transferred), got %d", result.FilesSynced)
+	}
+	if result.Errors != 0 {
+		t.Errorf("expected 0 errors, got %d", result.Errors)
+	}
+
+	// The done file must never be re-fetched from the server
+	if session.fetched["hello.txt"] != 0 {
+		t.Errorf("done file was re-fetched %d times", session.fetched["hello.txt"])
+	}
+	if session.fetched["nested/a.go"] != 1 {
+		t.Errorf("expected pending file fetched once, got %d", session.fetched["nested/a.go"])
+	}
+}
+
+func TestSyncProfile_RetriesWithinRun(t *testing.T) {
+	sourceDir, destDir := setupTestFiles(t)
+	token := "test-token-123"
+
+	helloData := []byte("hello world")
+	files := []mockFile{
+		{path: "hello.txt", data: helloData, hash: fileHash(t, filepath.Join(sourceDir, "hello.txt"))},
+	}
+	// Fail the first two fetch attempts, succeed on the third
+	srv, _ := newMockServerWithFailures(t, token, sourceDir, files, map[string]int{"hello.txt": 2})
+	defer srv.Close()
+
+	result, err := SyncProfile(srv.URL, token, "test-profile", "device-1", destDir, false, nil)
+	if err != nil {
+		t.Fatalf("SyncProfile: %v", err)
+	}
+
+	if result.FilesSynced != 1 {
+		t.Errorf("expected 1 file synced after in-run retries, got %d", result.FilesSynced)
+	}
+	if result.Errors != 0 {
+		t.Errorf("expected 0 errors, got %d", result.Errors)
+	}
+
+	data, err := os.ReadFile(filepath.Join(destDir, "hello.txt"))
+	if err != nil {
+		t.Fatalf("reading synced file: %v", err)
+	}
+	if string(data) != string(helloData) {
+		t.Errorf("content mismatch: got %q", string(data))
+	}
+}
+
+func TestSyncProfile_FailsAfterMaxRetries(t *testing.T) {
+	sourceDir, destDir := setupTestFiles(t)
+	token := "test-token-123"
+
+	files := []mockFile{
+		{path: "hello.txt", data: []byte("hello world"), hash: fileHash(t, filepath.Join(sourceDir, "hello.txt"))},
+	}
+	// Fail every fetch attempt — the in-run retry must cap at MaxRetries
+	srv, _ := newMockServerWithFailures(t, token, sourceDir, files, map[string]int{"hello.txt": 100})
+	defer srv.Close()
+
+	result, err := SyncProfile(srv.URL, token, "test-profile", "device-1", destDir, false, nil)
+	if err != nil {
+		t.Fatalf("SyncProfile: %v", err)
 	}
 
 	if result.FilesSynced != 0 {

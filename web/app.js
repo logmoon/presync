@@ -299,6 +299,7 @@
         }).then(function (startResp) {
             var sessionPath = startResp.session;
             var files = startResp.files || [];
+            var delta = startResp.delta || { to_delete: [] };
             var done = 0;
             var errors = 0;
 
@@ -317,25 +318,44 @@
 
             function syncNext() {
                 if (done + errors >= files.length) {
-                    fetch("/sync/complete", {
-                        method: "POST",
-                        headers: {
-                            "Content-Type": "application/json",
-                            "X-Presync-Token": token
-                        },
-                        body: JSON.stringify({ session: sessionPath })
-                    }).then(function () {
-                        androidSyncActive = false;
-                        setProgressPulse(false);
-                        updateSyncProgress(profileName, done, files.length, errors);
-                    }).catch(function () {
-                        androidSyncActive = false;
-                        setProgressPulse(false);
+                    // Mirror-mode deletions: apply after the file phase, when
+                    // the full delta is known (server only sends to_delete for
+                    // mirror profiles).
+                    applyDeletions(profileName, delta, function () {
+                        fetch("/sync/complete", {
+                            method: "POST",
+                            headers: {
+                                "Content-Type": "application/json",
+                                "X-Presync-Token": token
+                            },
+                            body: JSON.stringify({ session: sessionPath })
+                        }).then(function (res) {
+                            return res.json().then(function (data) {
+                                if (!res.ok) throw new Error(data.error || "complete failed");
+                                return data;
+                            });
+                        }).then(function () {
+                            androidSyncActive = false;
+                            setProgressPulse(false);
+                            updateSyncProgress(profileName, done, files.length, errors);
+                        }).catch(function () {
+                            androidSyncActive = false;
+                            setProgressPulse(false);
+                        });
                     });
                     return;
                 }
 
                 var f = files[done + errors];
+
+                // Files the server marked with a SHA256 are already done
+                // (resume) — skip them without re-fetching.
+                if (f.sha256) {
+                    done++;
+                    syncNext();
+                    return;
+                }
+
                 updateSyncProgress(profileName, done, files.length, errors);
 
                 fetch("/sync/file?session=" + encodeURIComponent(sessionPath) + "&path=" + encodeURIComponent(f.path), {
@@ -417,6 +437,30 @@
             '<div class="progress-fill" style="width:' + pct + '%"></div>' +
             "</div>" +
             "</div>";
+    }
+
+    // Deletes mirror-mode leftovers from the device. Only the Android bridge
+    // can delete on-device files; on other surfaces this is a no-op (the PC
+    // client and server-side syncs handle their own deletions).
+    function applyDeletions(profileName, delta, onDone) {
+        var deletes = delta.to_delete || [];
+        if (deletes.length === 0 || !isAndroid()) {
+            onDone();
+            return;
+        }
+
+        var i = 0;
+        function next() {
+            if (i >= deletes.length) {
+                onDone();
+                return;
+            }
+            var del = deletes[i++];
+            window.AndroidBridge.deleteFile(profileName + "/" + del.path, function (result) {
+                next();
+            });
+        }
+        next();
     }
 
     function renderProgress(el) {

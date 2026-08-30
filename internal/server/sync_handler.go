@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"presync/internal/config"
@@ -17,6 +18,7 @@ type syncStartRequest struct {
 	DeviceID            string        `json:"device_id"`
 	Profile             string        `json:"profile"`
 	DestinationManifest diff.Manifest `json:"destination_manifest"`
+	Fresh               bool          `json:"fresh"`
 }
 
 type syncStartResponse struct {
@@ -132,6 +134,22 @@ func handleSyncStart() http.HandlerFunc {
 			return
 		}
 
+		if req.Fresh && existing != nil {
+			if err := transfer.DeleteSession(existing.Path); err != nil {
+				logError("deleting session for --fresh: %v", err)
+			}
+			existing = nil
+		}
+
+		sourceManifest, err := diff.BuildManifest(profile.Source)
+		if err != nil {
+			logError("building source manifest: %v", err)
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to build source manifest"})
+			return
+		}
+
+		delta := diff.ComputeDelta(sourceManifest, req.DestinationManifest, profile.Mode)
+
 		var sess *transfer.Session
 		if existing != nil && !existing.IsComplete() {
 			if existing.IsStale() {
@@ -140,55 +158,22 @@ func handleSyncStart() http.HandlerFunc {
 				sess = existing
 			}
 		}
-		if sess == nil {
-			sourceManifest, err := diff.BuildManifest(profile.Source)
-			if err != nil {
-				logError("building source manifest: %v", err)
-				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to build source manifest"})
-				return
-			}
 
-			delta := diff.ComputeDelta(sourceManifest, req.DestinationManifest, profile.Mode)
-
-			var filePaths []string
-			for _, f := range sourceManifest.Files {
-				for _, a := range delta.ToAdd {
-					if f.Path == a.Path {
-						filePaths = append(filePaths, f.Path)
-						break
-					}
-				}
-				for _, a := range delta.ToUpdate {
-					if f.Path == a.Path {
-						filePaths = append(filePaths, f.Path)
-						break
-					}
-				}
-			}
-
-			sess = transfer.NewSession(req.DeviceID, req.Profile, filePaths)
-			if err := sess.Save(); err != nil {
-				logError("saving session: %v", err)
-				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to save session"})
-				return
-			}
-
+		if sess != nil {
+			// Resume: the session file list is authoritative for what remains,
+			// but the delta is recomputed so the client still receives
+			// mirror-mode deletions for files it has since accumulated.
 			var files []fileInfo
-			for _, fp := range filePaths {
-				for _, f := range sourceManifest.Files {
-					if f.Path == fp {
-						files = append(files, fileInfo{
-							Path:   f.Path,
-							Size:   f.Size,
-							SHA256: f.SHA256,
-						})
-						break
-					}
-				}
+			for _, fs := range sess.Files {
+				files = append(files, fileInfo{
+					Path:   fs.Path,
+					SHA256: fs.SHA256,
+				})
 			}
 
-			logInfo("sync started: device=%s profile=%s files=%d adds=%d updates=%d deletes=%d",
-				req.DeviceID, req.Profile, len(filePaths), len(delta.ToAdd), len(delta.ToUpdate), len(delta.ToDelete))
+			pending := sess.PendingFiles()
+			logInfo("sync resumed: device=%s profile=%s pending=%d delta_adds=%d deletes=%d",
+				req.DeviceID, req.Profile, len(pending), len(delta.ToAdd), len(delta.ToDelete))
 
 			writeJSON(w, http.StatusOK, syncStartResponse{
 				Session:     sess.Path,
@@ -199,26 +184,83 @@ func handleSyncStart() http.HandlerFunc {
 			return
 		}
 
-		var files []fileInfo
-		for _, fs := range sess.Files {
-			files = append(files, fileInfo{
-				Path:   fs.Path,
-				SHA256: fs.SHA256,
-			})
+		// Fresh session. The session covers the delta, plus ambiguous files
+		// (size+mtime match) whose SHA-256 the server computes so the client
+		// can verify its local copy without re-transferring.
+		filePaths, files, err := buildSessionFiles(sourceManifest, req.DestinationManifest, profile, delta)
+		if err != nil {
+			logError("building session files: %v", err)
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to prepare session"})
+			return
 		}
 
-		pending := sess.PendingFiles()
-		logInfo("sync resumed: device=%s profile=%s pending=%d", req.DeviceID, req.Profile, len(pending))
+		sess = transfer.NewSession(req.DeviceID, req.Profile, filePaths)
+		if err := sess.Save(); err != nil {
+			logError("saving session: %v", err)
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to save session"})
+			return
+		}
+
+		logInfo("sync started: device=%s profile=%s files=%d adds=%d updates=%d deletes=%d verify=%d",
+			req.DeviceID, req.Profile, len(filePaths), len(delta.ToAdd), len(delta.ToUpdate), len(delta.ToDelete), len(files)-len(delta.ToAdd)-len(delta.ToUpdate))
 
 		writeJSON(w, http.StatusOK, syncStartResponse{
-			Session: sess.Path,
-			Delta: diff.Delta{
-				ToAdd: make([]diff.FileAction, 0),
-			},
+			Session:     sess.Path,
+			Delta:       delta,
 			Files:       files,
 			Destination: destination,
 		})
 	}
+}
+
+// buildSessionFiles returns the list of session file paths and the response
+// file info for a fresh session: delta files (adds/updates) plus ambiguous
+// files that need hash verification against the client's local copy.
+func buildSessionFiles(sourceManifest diff.Manifest, dstManifest diff.Manifest, profile *config.Profile, delta diff.Delta) ([]string, []fileInfo, error) {
+	var filePaths []string
+	var files []fileInfo
+	seen := make(map[string]bool, len(delta.ToAdd)+len(delta.ToUpdate))
+
+	for _, a := range delta.ToAdd {
+		filePaths = append(filePaths, a.Path)
+		seen[a.Path] = true
+	}
+	for _, a := range delta.ToUpdate {
+		filePaths = append(filePaths, a.Path)
+		seen[a.Path] = true
+	}
+
+	dstIndex := manifestIndex(dstManifest)
+
+	for _, f := range sourceManifest.Files {
+		if seen[f.Path] {
+			files = append(files, fileInfo{Path: f.Path, Size: f.Size})
+			continue
+		}
+		dst, ok := dstIndex[f.Path]
+		if !ok || dst.Size != f.Size || dst.ModTime != f.ModTime {
+			continue
+		}
+		// Ambiguous: same size+mtime. Hash the source so the client can verify
+		// its local copy; only transfer if content differs.
+		hash, err := transfer.ComputeFileHash(filepath.Join(profile.Source, f.Path))
+		if err != nil {
+			logError("hashing ambiguous file %s: %v", f.Path, err)
+			continue
+		}
+		filePaths = append(filePaths, f.Path)
+		files = append(files, fileInfo{Path: f.Path, Size: f.Size, SHA256: hash})
+	}
+
+	return filePaths, files, nil
+}
+
+func manifestIndex(m diff.Manifest) map[string]diff.FileEntry {
+	idx := make(map[string]diff.FileEntry, len(m.Files))
+	for _, f := range m.Files {
+		idx[f.Path] = f
+	}
+	return idx
 }
 
 func handleSyncFile() http.HandlerFunc {
@@ -258,18 +300,11 @@ func handleSyncFile() http.HandlerFunc {
 
 		var offset int64
 		if offsetStr != "" {
-			if _, err := fmt.Sscanf(offsetStr, "%d", &offset); err != nil {
+			offset, err = strconv.ParseInt(offsetStr, 10, 64)
+			if err != nil || offset < 0 {
 				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid offset"})
 				return
 			}
-		}
-
-		sess.MarkInProgress(filePath)
-		if offset > 0 {
-			sess.UpdateOffset(filePath, offset)
-		}
-		if err := sess.Save(); err != nil {
-			logError("saving session state: %v", err)
 		}
 
 		profile := findProfile(cfg, sess.Profile)
@@ -278,10 +313,27 @@ func handleSyncFile() http.HandlerFunc {
 			return
 		}
 
+		// Validate the source file BEFORE mutating session state. A failure here
+		// must leave the file pending (resumable), not stuck in_progress.
 		fullPath := filepath.Join(profile.Source, filePath)
 
-		if _, err := os.Stat(fullPath); os.IsNotExist(err) {
-			writeJSON(w, http.StatusNotFound, map[string]string{"error": fmt.Sprintf("file %s not found on server", filePath)})
+		info, err := os.Stat(fullPath)
+		if err != nil {
+			if os.IsNotExist(err) {
+				writeJSON(w, http.StatusNotFound, map[string]string{"error": fmt.Sprintf("file %s not found on server", filePath)})
+			} else {
+				logError("stating file %s: %v", filePath, err)
+				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to read file metadata"})
+			}
+			return
+		}
+		if !info.Mode().IsRegular() {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": fmt.Sprintf("file %s is not a regular file", filePath)})
+			return
+		}
+
+		if offset > info.Size() {
+			writeJSON(w, http.StatusRequestedRangeNotSatisfiable, map[string]string{"error": fmt.Sprintf("offset %d exceeds file size %d", offset, info.Size())})
 			return
 		}
 
@@ -292,11 +344,21 @@ func handleSyncFile() http.HandlerFunc {
 			return
 		}
 
+		// File is verified readable and hashable — only now is the transfer
+		// state marked in_progress.
+		sess.MarkInProgress(filePath)
+		if offset > 0 {
+			sess.UpdateOffset(filePath, offset)
+		}
+		if err := sess.Save(); err != nil {
+			logError("saving session state: %v", err)
+		}
+
 		w.Header().Set("Content-Type", "application/octet-stream")
 		w.Header().Set("X-Presync-Offset", fmt.Sprintf("%d", offset))
 		w.Header().Set("X-Presync-SHA256", hash)
 
-		if _, err := transfer.SendFile(w, fullPath, offset); err != nil {
+		if err := transfer.StreamFile(w, fullPath, offset); err != nil {
 			logError("sending file %s: %v", filePath, err)
 			return
 		}
@@ -470,6 +532,48 @@ func handleSyncComplete() http.HandlerFunc {
 
 		logInfo("sync complete: session=%s", req.Session)
 		writeJSON(w, http.StatusOK, syncCompleteResponse{OK: true})
+	}
+}
+
+func handleSyncError() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+			return
+		}
+
+		var req struct {
+			Session string `json:"session"`
+			Path    string `json:"path"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+			return
+		}
+
+		if req.Session == "" || req.Path == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "session and path are required"})
+			return
+		}
+
+		sess, err := resolveAndLoadSession(req.Session)
+		if err != nil {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+			return
+		}
+
+		if sess.GetFile(req.Path) == nil {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "file not in session"})
+			return
+		}
+
+		sess.MarkError(req.Path)
+		if err := sess.Save(); err != nil {
+			logError("saving session: %v", err)
+		}
+
+		logInfo("file failed after retries: %s (attempts=%d)", req.Path, sess.GetFile(req.Path).Attempts)
+		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 	}
 }
 
