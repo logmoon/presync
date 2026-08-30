@@ -276,23 +276,30 @@ func newServer(cfg *config.Config) *http.Server {
 
 	// Unauthenticated routes
 	mux.HandleFunc("/health", handleHealth())
-	mux.HandleFunc("/reload", handleReload())
 	mux.HandleFunc("/pair", handlePairStart())
 	mux.HandleFunc("/pair/accept", handlePairAccept())
-	mux.HandleFunc("/pair/confirm", handlePairConfirm())
 	mux.HandleFunc("/pair/destinations", handlePairDestinations())
-	mux.HandleFunc("/pair/discard", handlePairDiscard())
-	mux.HandleFunc("/pair/status", handlePairStatus())
 	mux.HandleFunc("/pair/confirmed", handlePairConfirmed())
-	mux.HandleFunc("/web/token", handleWebToken())
-	mux.HandleFunc("/web/device-id", handleWebDeviceID())
-	mux.HandleFunc("/web/sync", handleWebSync())
-	mux.HandleFunc("/web/sessions", handleWebSessions())
 
-	// Authenticated routes
-	mux.HandleFunc("/profiles", withAuth(handleProfiles()))
-	mux.HandleFunc("/profiles/detail", withAuth(handleProfilesDetail()))
-	mux.HandleFunc("/status", withAuth(handleStatus()))
+	// Web bootstrap: hands out the scoped local token. The token is only valid
+	// on web-UI routes (withWebAuth), never on /sync* file-download routes.
+	mux.HandleFunc("/web/token", handleWebToken())
+
+	// Local-admin routes: CLI on the server machine only (loopback + local token)
+	mux.HandleFunc("/pair/confirm", withLocalAdmin(handlePairConfirm()))
+	mux.HandleFunc("/pair/discard", withLocalAdmin(handlePairDiscard()))
+	mux.HandleFunc("/pair/status", withLocalAdmin(handlePairStatus()))
+	mux.HandleFunc("/reload", withLocalAdmin(handleReload()))
+
+	// Web-UI routes: device token or local token
+	mux.HandleFunc("/web/device-id", withWebAuth(handleWebDeviceID()))
+	mux.HandleFunc("/web/sync", withWebAuth(handleWebSync()))
+	mux.HandleFunc("/web/sessions", withWebAuth(handleWebSessions()))
+	mux.HandleFunc("/profiles", withWebAuth(handleProfiles()))
+	mux.HandleFunc("/profiles/detail", withWebAuth(handleProfilesDetail()))
+	mux.HandleFunc("/status", withWebAuth(handleStatus()))
+
+	// Device-token-only routes: raw file transfer and sync state mutation
 	mux.HandleFunc("/sync", withAuth(handleSyncStart()))
 	mux.HandleFunc("/sync/file", withAuth(handleSyncFile()))
 	mux.HandleFunc("/sync/confirm", withAuth(handleSyncConfirm()))

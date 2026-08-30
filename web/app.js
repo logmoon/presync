@@ -740,7 +740,7 @@
                         confirmBtn.disabled = false;
                         return;
                     }
-                    apiCall("GET", "/pair/confirmed").then(function (result) {
+                    apiCall("GET", "/pair/confirmed?token=" + encodeURIComponent(sessionToken)).then(function (result) {
                         if (result.confirmed) {
                             clearInterval(pollInterval);
                             token = result.token;

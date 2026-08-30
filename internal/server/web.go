@@ -63,6 +63,11 @@ func handleWebDeviceID() http.HandlerFunc {
 
 		dev, ok := config.ValidateToken(token)
 		if !ok {
+			// Local token (web UI bootstrap) — report the local identity.
+			if localToken, err := config.GetLocalToken(); err == nil && token == localToken {
+				writeJSON(w, http.StatusOK, map[string]string{"device_id": "local", "device_name": "local"})
+				return
+			}
 			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid token"})
 			return
 		}

@@ -63,6 +63,8 @@ echo "=== Starting daemon ==="
 $PRESYNC start
 sleep 1
 
+LOCAL_TOKEN=$(curl -s $BASE/web/token | python3 -c "import sys,json; print(json.load(sys.stdin)['token'])")
+
 # Check daemon is running
 STATUS=$($PRESYNC status 2>&1)
 assert_contains "daemon is running" "running" "$STATUS"
@@ -75,6 +77,9 @@ assert_contains "no token gets 401" "missing authentication token" "$BODY"
 BODY=$(curl -s -H "X-Presync-Token: bad-token" $BASE/status)
 assert_contains "wrong token gets 401" "invalid or revoked token" "$BODY"
 
+BODY=$(curl -s -H "X-Presync-Token: $LOCAL_TOKEN" $BASE/sync -X POST -d '{}')
+assert_contains "local token rejected on /sync" "invalid or revoked token" "$BODY"
+
 echo ""
 echo "=== Test 2: Pairing flow ==="
 PAIR_RESP=$(curl -s -X POST $BASE/pair)
@@ -84,7 +89,7 @@ PIN=$(echo "$PAIR_RESP" | python3 -c "import sys,json; print(json.load(sys.stdin
 assert_eq "token is 64 chars" "64" "${#TOKEN}"
 assert_eq "PIN is 4 chars" "4" "${#PIN}"
 
-STATUS_RESP=$(curl -s $BASE/pair/status)
+STATUS_RESP=$(curl -s -H "X-Presync-Token: $LOCAL_TOKEN" $BASE/pair/status)
 ACTIVE=$(echo "$STATUS_RESP" | python3 -c "import sys,json; print(json.load(sys.stdin)['active'])")
 assert_eq "session is active" "True" "$ACTIVE"
 
@@ -94,13 +99,13 @@ ACCEPT_RESP=$(curl -s -X POST $BASE/pair/accept \
 ACCEPT_STATUS=$(echo "$ACCEPT_RESP" | python3 -c "import sys,json; print(json.load(sys.stdin)['status'])")
 assert_eq "accept returns accepted" "accepted" "$ACCEPT_STATUS"
 
-STATUS_RESP=$(curl -s $BASE/pair/status)
+STATUS_RESP=$(curl -s -H "X-Presync-Token: $LOCAL_TOKEN" $BASE/pair/status)
 ACCEPTED=$(echo "$STATUS_RESP" | python3 -c "import sys,json; print(json.load(sys.stdin)['accepted'])")
 DEVNAME=$(echo "$STATUS_RESP" | python3 -c "import sys,json; print(json.load(sys.stdin)['device_name'])")
 assert_eq "session accepted" "True" "$ACCEPTED"
 assert_eq "device name correct" "test-phone" "$DEVNAME"
 
-CONFIRM_RESP=$(curl -s -X POST $BASE/pair/confirm)
+CONFIRM_RESP=$(curl -s -X POST -H "X-Presync-Token: $LOCAL_TOKEN" $BASE/pair/confirm)
 DEVICE_ID=$(echo "$CONFIRM_RESP" | python3 -c "import sys,json; print(json.load(sys.stdin)['device_id'])")
 LONG_TOKEN=$(echo "$CONFIRM_RESP" | python3 -c "import sys,json; print(json.load(sys.stdin)['token'])")
 
@@ -121,7 +126,7 @@ echo "=== Test 4: Pairing conflict ==="
 curl -s -X POST $BASE/pair > /dev/null
 BODY=$(curl -s -X POST $BASE/pair)
 assert_contains "second session rejected" "already active" "$BODY"
-curl -s -X POST $BASE/pair/discard > /dev/null
+curl -s -X POST -H "X-Presync-Token: $LOCAL_TOKEN" $BASE/pair/discard > /dev/null
 
 echo ""
 echo "=== Test 5: Unpair ==="

@@ -106,12 +106,13 @@ assert_contains "daemon is running" "running" "$STATUS"
 
 echo ""
 echo "=== Pairing a device ==="
+LOCAL_TOKEN=$(curl -s $BASE/web/token | python3 -c "import sys,json; print(json.load(sys.stdin)['token'])")
 PAIR_RESP=$(curl -s -X POST $BASE/pair)
 TOKEN=$(echo "$PAIR_RESP" | python3 -c "import sys,json; print(json.load(sys.stdin)['token'])")
 curl -s -X POST $BASE/pair/accept \
   -H "Content-Type: application/json" \
   -d "{\"token\": \"$TOKEN\", \"name\": \"test-client\"}" > /dev/null
-CONFIRM_RESP=$(curl -s -X POST $BASE/pair/confirm)
+CONFIRM_RESP=$(curl -s -X POST -H "X-Presync-Token: $LOCAL_TOKEN" $BASE/pair/confirm)
 DEVICE_ID=$(echo "$CONFIRM_RESP" | python3 -c "import sys,json; print(json.load(sys.stdin)['device_id'])")
 LONG_TOKEN=$(echo "$CONFIRM_RESP" | python3 -c "import sys,json; print(json.load(sys.stdin)['token'])")
 

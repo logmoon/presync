@@ -103,6 +103,32 @@ func TestAcceptSession(t *testing.T) {
 	}
 }
 
+func TestAcceptSessionSingleUse(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("PRESYNC_CONFIG_DIR", dir)
+
+	DiscardSession()
+	if _, err := NewSession(); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+
+	if err := AcceptSession("first-device"); err != nil {
+		t.Fatalf("first AcceptSession: %v", err)
+	}
+
+	if err := AcceptSession("second-device"); err == nil {
+		t.Fatal("expected second AcceptSession to fail (single-use token)")
+	}
+
+	session := GetSession()
+	if session == nil {
+		t.Fatal("expected session to still exist for confirm")
+	}
+	if session.DeviceName != "first-device" {
+		t.Errorf("expected device name 'first-device', got %q", session.DeviceName)
+	}
+}
+
 func TestConfirmSession(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("PRESYNC_CONFIG_DIR", dir)
@@ -155,6 +181,43 @@ func TestDiscardSession(t *testing.T) {
 
 	if GetSession() != nil {
 		t.Error("expected nil session after discard")
+	}
+}
+
+func TestGetLastConfirmedRequiresSessionToken(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("PRESYNC_CONFIG_DIR", dir)
+
+	DiscardSession()
+	session, err := NewSession()
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+
+	AcceptSession("token-bound-device")
+	token, _, _, err := ConfirmSession()
+	if err != nil {
+		t.Fatalf("ConfirmSession: %v", err)
+	}
+
+	// Correct session token retrieves the result
+	devID, gotToken, _, ok := GetLastConfirmed(session.Token)
+	if !ok {
+		t.Fatal("expected confirmed result with correct session token")
+	}
+	if devID == "" {
+		t.Error("expected non-empty device ID")
+	}
+	if gotToken != token {
+		t.Errorf("expected token %s, got %s", token, gotToken)
+	}
+
+	// Wrong or missing session token is denied
+	if _, _, _, ok := GetLastConfirmed("wrong-token"); ok {
+		t.Error("expected denial with wrong session token")
+	}
+	if _, _, _, ok := GetLastConfirmed(""); ok {
+		t.Error("expected denial with missing session token")
 	}
 }
 

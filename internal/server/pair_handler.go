@@ -180,11 +180,17 @@ func handlePairDestinations() http.HandlerFunc {
 		}
 
 		var req struct {
+			Token        string            `json:"token"`
 			Name         string            `json:"name"`
 			Destinations map[string]string `json:"destinations"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+			return
+		}
+
+		if req.Token == "" || req.Token != session.Token {
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": "session token required to register destinations"})
 			return
 		}
 
@@ -216,6 +222,11 @@ func handlePairDiscard() http.HandlerFunc {
 
 func handlePairStatus() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+			return
+		}
+
 		session := pairing.GetSession()
 		if session == nil {
 			writeJSON(w, http.StatusOK, map[string]interface{}{"active": false})
@@ -237,7 +248,8 @@ func handlePairConfirmed() http.HandlerFunc {
 			return
 		}
 
-		deviceID, token, destinations, ok := pairing.GetLastConfirmed()
+		sessionToken := r.URL.Query().Get("token")
+		deviceID, token, destinations, ok := pairing.GetLastConfirmed(sessionToken)
 		if !ok {
 			writeJSON(w, http.StatusOK, map[string]interface{}{"confirmed": false})
 			return

@@ -186,7 +186,7 @@ func TestPollPairConfirmed_Success(t *testing.T) {
 	defer server.Close()
 
 	addr := server.Listener.Addr().String()
-	deviceID, token, dests, err := pollPairConfirmed(addr, 5*time.Second)
+	deviceID, token, dests, err := pollPairConfirmed(addr, "sess-token", 5*time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -211,7 +211,7 @@ func TestPollPairConfirmed_Timeout(t *testing.T) {
 	defer server.Close()
 
 	addr := server.Listener.Addr().String()
-	_, _, _, err := pollPairConfirmed(addr, 1*time.Second)
+	_, _, _, err := pollPairConfirmed(addr, "sess-token", 1*time.Second)
 	if err == nil {
 		t.Fatal("expected timeout error")
 	}

@@ -19,6 +19,7 @@ class MainActivity : AppCompatActivity() {
 
     private lateinit var webView: WebView
     private lateinit var safBridge: SafBridge
+    private var trustedOrigin: String? = null
 
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -26,6 +27,12 @@ class MainActivity : AppCompatActivity() {
 
         val pairingUrl = intent?.getStringExtra("pairing_url")
         val serverUrl = getServerUrl()
+
+        if (pairingUrl != null && !isValidPairingUrl(pairingUrl)) {
+            startActivity(Intent(this, PairingActivity::class.java))
+            finish()
+            return
+        }
 
         if (pairingUrl == null && serverUrl == null) {
             startActivity(Intent(this, PairingActivity::class.java))
@@ -84,12 +91,13 @@ class MainActivity : AppCompatActivity() {
     private fun setupWebView(url: String) {
         webView = WebView(this).also { setContentView(it) }
 
-        safBridge = SafBridge(this, webView)
+        trustedOrigin = originOf(url)
+        safBridge = SafBridge(this, webView, trustedOrigin)
 
         webView.settings.apply {
             javaScriptEnabled = true
             domStorageEnabled = true
-            allowFileAccess = true
+            allowFileAccess = false
             mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
         }
 
@@ -97,6 +105,10 @@ class MainActivity : AppCompatActivity() {
 
         webView.webViewClient = object : WebViewClient() {
             override fun shouldOverrideUrlLoading(view: WebView, request: android.webkit.WebResourceRequest): Boolean {
+                val origin = trustedOrigin
+                if (origin != null && !request.url.toString().startsWith(origin)) {
+                    return true
+                }
                 return false
             }
 
@@ -153,5 +165,25 @@ class MainActivity : AppCompatActivity() {
             .edit()
             .clear()
             .apply()
+    }
+
+    private fun originOf(url: String): String {
+        return try {
+            val u = Uri.parse(url)
+            "${u.scheme}://${u.host}" + if (u.port > 0) ":${u.port}" else ""
+        } catch (e: Exception) {
+            url
+        }
+    }
+
+    private fun isValidPairingUrl(url: String): Boolean {
+        return try {
+            val u = Uri.parse(url)
+            (u.scheme == "http" || u.scheme == "https") &&
+                !u.host.isNullOrEmpty() &&
+                !u.getQueryParameter("token").isNullOrEmpty()
+        } catch (e: Exception) {
+            false
+        }
     }
 }

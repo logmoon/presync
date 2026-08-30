@@ -66,7 +66,7 @@ func doPairing(pairingURL, destOverride string, fresh bool, progress func(path s
 	fmt.Printf("Verify this matches the server PIN, then confirm on the server.\n")
 	fmt.Println("Waiting for server to confirm pairing...")
 
-	deviceID, longLivedToken, destinations, err := pollPairConfirmed(serverAddr, 60*time.Second)
+	deviceID, longLivedToken, destinations, err := pollPairConfirmed(serverAddr, sessionToken, 60*time.Second)
 	if err != nil {
 		return fmt.Errorf("pairing confirm: %w", err)
 	}
@@ -317,14 +317,14 @@ type pairConfirmedResponse struct {
 	Destinations map[string]string `json:"destinations,omitempty"`
 }
 
-func pollPairConfirmed(serverAddr string, timeout time.Duration) (deviceID, longLivedToken string, destinations map[string]string, err error) {
+func pollPairConfirmed(serverAddr, sessionToken string, timeout time.Duration) (deviceID, longLivedToken string, destinations map[string]string, err error) {
 	c := &http.Client{Timeout: 5 * time.Second}
 	deadline := time.Now().Add(timeout)
 
 	for time.Now().Before(deadline) {
 		time.Sleep(1 * time.Second)
 
-		resp, err := c.Get(fmt.Sprintf("http://%s/pair/confirmed", serverAddr))
+		resp, err := c.Get(fmt.Sprintf("http://%s/pair/confirmed?token=%s", serverAddr, url.QueryEscape(sessionToken)))
 		if err != nil {
 			continue
 		}

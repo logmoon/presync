@@ -108,6 +108,7 @@ echo ""
 echo "=== Test 1: Pair via presync connect ==="
 
 # Start pairing on the server to get a session token
+LOCAL_TOKEN=$(curl -s $BASE/web/token | python3 -c "import sys,json; print(json.load(sys.stdin)['token'])")
 PAIR_RESP=$(curl -s -X POST $BASE/pair)
 TOKEN=$(echo "$PAIR_RESP" | python3 -c "import sys,json; print(json.load(sys.stdin)['token'])")
 PIN=$(echo "$PAIR_RESP" | python3 -c "import sys,json; print(json.load(sys.stdin)['pin'])")
@@ -115,17 +116,23 @@ PIN=$(echo "$PAIR_RESP" | python3 -c "import sys,json; print(json.load(sys.stdin
 # Register destinations for the client on the server (must be after pair start)
 curl -s -X POST $BASE/pair/destinations \
   -H "Content-Type: application/json" \
-  -d "{\"name\": \"test-client\", \"destinations\": {\"Music\": \"$CLIENT_DIR\"}}" > /dev/null
+  -d "{\"token\": \"$TOKEN\", \"name\": \"test-client\", \"destinations\": {\"Music\": \"$CLIENT_DIR\"}}" > /dev/null
 
-PAIR_URL="http://localhost:$PORT/pair?token=$TOKEN"
+PAIR_URL="http://localhost:$PORT/?token=$TOKEN"
 
 # Use a separate config dir for the client side
 CLIENT_CONFIG="$PRESYNC_CONFIG_DIR/client-config"
 mkdir -p "$CLIENT_CONFIG"
 
-# Run connect in background, feed it inputs
-# Input: "y" (confirm PIN)
-CONNECT_OUTPUT=$(PRESYNC_CONFIG_DIR="$CLIENT_CONFIG" timeout 10 $PRESYNC connect "$PAIR_URL" <<< "y" 2>&1) || true
+# Run connect in background; confirm pairing on the server side (as the CLI
+# user would after verifying the PIN)
+CONNECT_LOG="$CLIENT_CONFIG/connect.log"
+(PRESYNC_CONFIG_DIR="$CLIENT_CONFIG" timeout 30 $PRESYNC connect "$PAIR_URL" > "$CONNECT_LOG" 2>&1) &
+CONNECT_PID=$!
+sleep 3
+curl -s -X POST -H "X-Presync-Token: $LOCAL_TOKEN" $BASE/pair/confirm > /dev/null
+wait $CONNECT_PID || true
+CONNECT_OUTPUT=$(cat "$CONNECT_LOG")
 
 assert_contains "pairing succeeded" "Paired successfully" "$CONNECT_OUTPUT"
 assert_contains "sync started" "Syncing" "$CONNECT_OUTPUT"

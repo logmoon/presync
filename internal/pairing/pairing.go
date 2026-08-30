@@ -20,6 +20,7 @@ type Session struct {
 	PIN          string
 	CreatedAt    time.Time
 	Accepted     bool
+	Consumed     bool
 	DeviceName   string
 	Destinations map[string]string
 }
@@ -30,6 +31,8 @@ var (
 
 	// Last confirmed pairing result, stored briefly so the web UI and PC client
 	// can retrieve the token after the CLI confirms (they don't call /pair/confirm).
+	// Access is bound to the pairing session token that started the pairing.
+	lastConfirmedSessionToken string
 	lastConfirmedDeviceID     string
 	lastConfirmedToken        string
 	lastConfirmedDestinations map[string]string
@@ -80,7 +83,12 @@ func AcceptSession(deviceName string) error {
 		return fmt.Errorf("no active pairing session or session expired")
 	}
 
+	if current.Consumed {
+		return fmt.Errorf("pairing session already accepted by another device")
+	}
+
 	current.Accepted = true
+	current.Consumed = true
 	current.DeviceName = deviceName
 	return nil
 }
@@ -114,7 +122,10 @@ func ConfirmSession() (token string, deviceID string, destinations map[string]st
 		return "", "", nil, fmt.Errorf("adding device: %w", err)
 	}
 
-	// Store confirmation result briefly so the web UI and PC client can retrieve it
+	// Store confirmation result briefly so the web UI and PC client can retrieve it.
+	// The result is bound to this session's token: only the device that scanned
+	// the QR (and therefore holds the session token) can poll it back.
+	lastConfirmedSessionToken = current.Token
 	lastConfirmedDeviceID = dev.ID
 	lastConfirmedToken = token
 	lastConfirmedDestinations = destinations
@@ -144,13 +155,17 @@ func IsExpired() bool {
 	return current == nil || time.Since(current.CreatedAt) >= sessionTTL
 }
 
-// GetLastConfirmed returns the device ID, token, and destinations from the most recent
-// confirmation, if it happened within the last 30 seconds. Returns empty
-// values if no recent confirmation exists.
-func GetLastConfirmed() (deviceID, token string, destinations map[string]string, ok bool) {
+// GetLastConfirmed returns the device ID, token, and destinations from the most
+// recent confirmation, if it happened within the last 30 seconds and the caller
+// presents the pairing session token that started it. Returns empty values
+// otherwise.
+func GetLastConfirmed(sessionToken string) (deviceID, token string, destinations map[string]string, ok bool) {
 	mu.Lock()
 	defer mu.Unlock()
 	if lastConfirmedToken == "" || time.Since(lastConfirmedAt) > 30*time.Second {
+		return "", "", nil, false
+	}
+	if sessionToken == "" || sessionToken != lastConfirmedSessionToken {
 		return "", "", nil, false
 	}
 	return lastConfirmedDeviceID, lastConfirmedToken, lastConfirmedDestinations, true

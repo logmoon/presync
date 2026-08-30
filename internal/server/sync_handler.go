@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"presync/internal/config"
 	"presync/internal/diff"
@@ -81,6 +82,11 @@ func handleSyncStart() http.HandlerFunc {
 
 		if req.DeviceID == "" || req.Profile == "" {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "device_id and profile are required"})
+			return
+		}
+
+		if !validSyncIdentifier(req.DeviceID) || !validSyncIdentifier(req.Profile) {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "device_id and profile must not contain path separators"})
 			return
 		}
 
@@ -233,7 +239,7 @@ func handleSyncFile() http.HandlerFunc {
 			return
 		}
 
-		sess, err := transfer.LoadSession(sessionPath)
+		sess, err := resolveAndLoadSession(sessionPath)
 		if err != nil {
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
 			return
@@ -319,7 +325,7 @@ func handleSyncConfirm() http.HandlerFunc {
 			return
 		}
 
-		sess, err := transfer.LoadSession(req.Session)
+		sess, err := resolveAndLoadSession(req.Session)
 		if err != nil {
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
 			return
@@ -386,7 +392,7 @@ func handleSyncStatus() http.HandlerFunc {
 			return
 		}
 
-		sess, err := transfer.LoadSession(sessionPath)
+		sess, err := resolveAndLoadSession(sessionPath)
 		if err != nil {
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
 			return
@@ -445,7 +451,7 @@ func handleSyncComplete() http.HandlerFunc {
 			return
 		}
 
-		sess, err := transfer.LoadSession(req.Session)
+		sess, err := resolveAndLoadSession(req.Session)
 		if err != nil {
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
 			return
@@ -474,4 +480,24 @@ func findProfile(cfg config.Config, name string) *config.Profile {
 		}
 	}
 	return nil
+}
+
+// resolveAndLoadSession resolves a client-supplied session identifier to a
+// path inside SessionsDir and loads it. Client input never reaches the
+// filesystem verbatim.
+func resolveAndLoadSession(raw string) (*transfer.Session, error) {
+	path, err := transfer.ResolveSession(raw)
+	if err != nil {
+		return nil, err
+	}
+	return transfer.LoadSession(path)
+}
+
+// validSyncIdentifier rejects device/profile names that would escape the
+// sessions directory when embedded in session filenames.
+func validSyncIdentifier(s string) bool {
+	if s == "" || s == "." || s == ".." {
+		return false
+	}
+	return !strings.ContainsAny(s, "/\\")
 }

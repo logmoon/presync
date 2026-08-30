@@ -245,3 +245,168 @@ func TestWithAuthValidToken(t *testing.T) {
 		t.Fatalf("expected 200, got %d", w.Code)
 	}
 }
+
+func TestWithAuthRejectsLocalToken(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("PRESYNC_CONFIG_DIR", dir)
+
+	localToken, err := config.GetLocalToken()
+	if err != nil {
+		t.Fatalf("GetLocalToken: %v", err)
+	}
+
+	handler := withAuth(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("ok"))
+	})
+
+	// Remote caller with a self-issued local token must be rejected
+	req := httptest.NewRequest(http.MethodGet, "/sync/file", nil)
+	req.Header.Set("X-Presync-Token", localToken)
+	req.RemoteAddr = "192.168.1.50:12345"
+	w := httptest.NewRecorder()
+
+	handler(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for remote local token, got %d", w.Code)
+	}
+}
+
+func TestWithAuthAcceptsLocalTokenOverLoopback(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("PRESYNC_CONFIG_DIR", dir)
+
+	localToken, err := config.GetLocalToken()
+	if err != nil {
+		t.Fatalf("GetLocalToken: %v", err)
+	}
+
+	handler := withAuth(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("ok"))
+	})
+
+	// CLI self-sync runs on the server machine — loopback + local token is fine
+	req := httptest.NewRequest(http.MethodGet, "/sync/file", nil)
+	req.Header.Set("X-Presync-Token", localToken)
+	req.RemoteAddr = "127.0.0.1:12345"
+	w := httptest.NewRecorder()
+
+	handler(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 for loopback local token, got %d", w.Code)
+	}
+}
+
+func TestWithWebAuthAcceptsLocalToken(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("PRESYNC_CONFIG_DIR", dir)
+
+	localToken, err := config.GetLocalToken()
+	if err != nil {
+		t.Fatalf("GetLocalToken: %v", err)
+	}
+
+	handler := withWebAuth(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("ok"))
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/web/sessions", nil)
+	req.Header.Set("X-Presync-Token", localToken)
+	w := httptest.NewRecorder()
+
+	handler(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+}
+
+func TestWithWebAuthRejectsUnknownToken(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("PRESYNC_CONFIG_DIR", dir)
+
+	handler := withWebAuth(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("ok"))
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/web/sessions", nil)
+	req.Header.Set("X-Presync-Token", "unknown-token")
+	w := httptest.NewRecorder()
+
+	handler(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401, got %d", w.Code)
+	}
+}
+
+func TestWithLocalAdminRejectsNonLoopback(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("PRESYNC_CONFIG_DIR", dir)
+
+	localToken, err := config.GetLocalToken()
+	if err != nil {
+		t.Fatalf("GetLocalToken: %v", err)
+	}
+
+	handler := withLocalAdmin(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("ok"))
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/pair/confirm", nil)
+	req.Header.Set("X-Presync-Token", localToken)
+	req.RemoteAddr = "192.168.1.50:12345"
+	w := httptest.NewRecorder()
+
+	handler(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for non-loopback, got %d", w.Code)
+	}
+}
+
+func TestWithLocalAdminAcceptsLoopbackAndToken(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("PRESYNC_CONFIG_DIR", dir)
+
+	localToken, err := config.GetLocalToken()
+	if err != nil {
+		t.Fatalf("GetLocalToken: %v", err)
+	}
+
+	handler := withLocalAdmin(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("ok"))
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/pair/confirm", nil)
+	req.Header.Set("X-Presync-Token", localToken)
+	req.RemoteAddr = "127.0.0.1:12345"
+	w := httptest.NewRecorder()
+
+	handler(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+}
+
+func TestWithLocalAdminRejectsWrongToken(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("PRESYNC_CONFIG_DIR", dir)
+
+	handler := withLocalAdmin(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("ok"))
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/pair/confirm", nil)
+	req.Header.Set("X-Presync-Token", "wrong")
+	req.RemoteAddr = "127.0.0.1:12345"
+	w := httptest.NewRecorder()
+
+	handler(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401, got %d", w.Code)
+	}
+}

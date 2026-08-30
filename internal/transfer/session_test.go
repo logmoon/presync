@@ -184,6 +184,55 @@ func TestSaveLoadRoundtrip(t *testing.T) {
 	}
 }
 
+func TestResolveSessionContainment(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("PRESYNC_CONFIG_DIR", dir)
+
+	if err := config.EnsureDirs(); err != nil {
+		t.Fatalf("EnsureDirs: %v", err)
+	}
+
+	s := NewSession("abc12345", "music", []string{"a.mp3"})
+	if err := s.Save(); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	// Plain filename resolves inside SessionsDir
+	base := filepath.Base(s.Path)
+	resolved, err := ResolveSession(base)
+	if err != nil {
+		t.Fatalf("ResolveSession: %v", err)
+	}
+	if filepath.Dir(resolved) != config.SessionsDir() {
+		t.Errorf("expected resolution inside SessionsDir, got %q", resolved)
+	}
+
+	// Full path is collapsed to its basename (still contained)
+	resolved2, err := ResolveSession(s.Path)
+	if err != nil {
+		t.Fatalf("ResolveSession(full path): %v", err)
+	}
+	if resolved2 != resolved {
+		t.Errorf("expected %q, got %q", resolved, resolved2)
+	}
+
+	// Traversal attempts collapse to a basename inside SessionsDir — never escape
+	for _, evil := range []string{"../../../../etc/passwd", "/etc/passwd", "..", "a/../../b.json"} {
+		r, err := ResolveSession(evil)
+		if err != nil {
+			continue
+		}
+		if filepath.Dir(r) != config.SessionsDir() {
+			t.Errorf("traversal %q escaped SessionsDir: %q", evil, r)
+		}
+	}
+
+	// Empty is rejected
+	if _, err := ResolveSession(""); err == nil {
+		t.Error("expected error for empty session name")
+	}
+}
+
 func TestFindSessionForDevice(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("PRESYNC_CONFIG_DIR", dir)

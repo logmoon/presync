@@ -68,7 +68,7 @@ func Pair(name, dest string) error {
 
 	// Send destinations if provided; nil destinations = client picks its own
 	if len(destinations) > 0 {
-		if err := sendDestinations(cfg.Daemon.Port, name, destinations); err != nil {
+		if err := sendDestinations(cfg.Daemon.Port, startResp.Token, name, destinations); err != nil {
 			return fmt.Errorf("registering destinations: %w", err)
 		}
 	}
@@ -204,10 +204,21 @@ func pairStart(port int) (*pairStartResult, error) {
 func waitForDevice(port int, sessionToken string) (string, error) {
 	deadline := time.Now().Add(60 * time.Second)
 
+	localToken, err := config.GetLocalToken()
+	if err != nil {
+		return "", fmt.Errorf("getting local token: %w", err)
+	}
+
 	for time.Now().Before(deadline) {
 		time.Sleep(1 * time.Second)
 
-		resp, err := http.Get(fmt.Sprintf("http://localhost:%d/pair/status", port))
+		req, reqErr := http.NewRequest(http.MethodGet, fmt.Sprintf("http://localhost:%d/pair/status", port), nil)
+		if reqErr != nil {
+			continue
+		}
+		req.Header.Set("X-Presync-Token", localToken)
+
+		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
 			continue
 		}
@@ -233,7 +244,18 @@ func waitForDevice(port int, sessionToken string) (string, error) {
 }
 
 func pairConfirm(port int) (*pairConfirmResult, error) {
-	resp, err := http.Post(fmt.Sprintf("http://localhost:%d/pair/confirm", port), "application/json", nil)
+	localToken, err := config.GetLocalToken()
+	if err != nil {
+		return nil, fmt.Errorf("getting local token: %w", err)
+	}
+
+	req, err := http.NewRequest(http.MethodPost, fmt.Sprintf("http://localhost:%d/pair/confirm", port), nil)
+	if err != nil {
+		return nil, fmt.Errorf("creating confirm request: %w", err)
+	}
+	req.Header.Set("X-Presync-Token", localToken)
+
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("confirming pair: %w", err)
 	}
@@ -253,11 +275,22 @@ func pairConfirm(port int) (*pairConfirmResult, error) {
 }
 
 func pairDiscard(port int) {
-	http.Post(fmt.Sprintf("http://localhost:%d/pair/discard", port), "application/json", bytes.NewReader(nil))
+	localToken, err := config.GetLocalToken()
+	if err != nil {
+		return
+	}
+
+	req, err := http.NewRequest(http.MethodPost, fmt.Sprintf("http://localhost:%d/pair/discard", port), bytes.NewReader(nil))
+	if err != nil {
+		return
+	}
+	req.Header.Set("X-Presync-Token", localToken)
+	http.DefaultClient.Do(req)
 }
 
-func sendDestinations(port int, name string, destinations map[string]string) error {
+func sendDestinations(port int, sessionToken, name string, destinations map[string]string) error {
 	body, _ := json.Marshal(map[string]interface{}{
+		"token":        sessionToken,
 		"name":         name,
 		"destinations": destinations,
 	})

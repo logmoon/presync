@@ -93,8 +93,10 @@ class PairingActivity : AppCompatActivity() {
             textSize = 14f
             setOnClickListener {
                 val url = urlInput.text.toString().trim()
-                if (url.isNotEmpty()) {
+                if (isValidPairingUrl(url)) {
                     proceedWithUrl(url)
+                } else {
+                    urlInput.error = "Enter a valid http://server:port/?token=... URL"
                 }
             }
         }
@@ -219,7 +221,7 @@ class PairingActivity : AppCompatActivity() {
                                 .addOnSuccessListener { barcodes ->
                                     for (barcode in barcodes) {
                                         val raw = barcode.rawValue ?: continue
-                                        if (raw.contains("?token=")) {
+                                        if (isValidPairingUrl(raw)) {
                                             runOnUiThread { proceedWithUrl(raw) }
                                             return@addOnSuccessListener
                                         }
@@ -256,6 +258,17 @@ class PairingActivity : AppCompatActivity() {
         }
         startActivity(intent)
         finish()
+    }
+
+    private fun isValidPairingUrl(url: String): Boolean {
+        return try {
+            val u = android.net.Uri.parse(url)
+            (u.scheme == "http" || u.scheme == "https") &&
+                !u.host.isNullOrEmpty() &&
+                !u.getQueryParameter("token").isNullOrEmpty()
+        } catch (e: Exception) {
+            false
+        }
     }
 
     override fun onRequestPermissionsResult(

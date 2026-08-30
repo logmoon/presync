@@ -22,8 +22,8 @@ const (
 )
 
 const (
-	MaxRetries          = 3
-	staleSessionAge     = 7 * 24 * time.Hour
+	MaxRetries           = 3
+	staleSessionAge      = 7 * 24 * time.Hour
 	activeSessionTimeout = 60 * time.Second
 )
 
@@ -77,6 +77,20 @@ func sessionPath(deviceID, profile string) string {
 	ts := time.Now().UTC().Format("20060102T150405Z")
 	name := fmt.Sprintf("%s-%s-%s.json", deviceID, profile, ts)
 	return filepath.Join(config.SessionsDir(), name)
+}
+
+// ResolveSession maps a client-supplied session identifier to a path strictly
+// inside SessionsDir. Only the basename is used, so a caller cannot read or
+// write session files outside the sessions directory.
+func ResolveSession(name string) (string, error) {
+	if name == "" {
+		return "", fmt.Errorf("session is required")
+	}
+	base := filepath.Base(name)
+	if base == "." || base == ".." || base == string(filepath.Separator) {
+		return "", fmt.Errorf("invalid session")
+	}
+	return filepath.Join(config.SessionsDir(), base), nil
 }
 
 func LoadSession(path string) (*Session, error) {

@@ -13,15 +13,29 @@ import java.util.Base64
 
 class SafBridge(
     private val activity: Activity,
-    private val webView: WebView
+    private val webView: WebView,
+    private val trustedOrigin: String?
 ) {
 
     private val prefs by lazy {
         activity.getSharedPreferences("presync_auth", Context.MODE_PRIVATE)
     }
 
+    // Only pages loaded from the paired server's origin may use the bridge.
+    // Navigation is additionally blocked cross-origin in MainActivity, so this
+    // is defense in depth against a malicious or redirected page.
+    private fun isTrustedPage(): Boolean {
+        val origin = trustedOrigin ?: return false
+        val url = webView.url ?: return false
+        return url.startsWith(origin)
+    }
+
     @JavascriptInterface
     fun writeFile(path: String, base64Data: String, callback: String) {
+        if (!isTrustedPage()) {
+            invokeCallback(callback, false, "Untrusted page")
+            return
+        }
         try {
             val treeUri = getDestinationUri() ?: run {
                 invokeCallback(callback, false, "No destination folder selected")
@@ -76,6 +90,10 @@ class SafBridge(
 
     @JavascriptInterface
     fun listDestination(@Suppress("UNUSED_PARAMETER") profileName: String, callback: String) {
+        if (!isTrustedPage()) {
+            invokeCallback(callback, false, "Untrusted page")
+            return
+        }
         try {
             val treeUri = getDestinationUri()
             if (treeUri == null) {
@@ -107,31 +125,37 @@ class SafBridge(
 
     @JavascriptInterface
     fun saveServerUrl(url: String) {
+        if (!isTrustedPage()) return
         (activity as? MainActivity)?.saveServerUrl(url)
     }
 
     @JavascriptInterface
     fun saveToken(token: String) {
+        if (!isTrustedPage()) return
         prefs.edit().putString("token", token).apply()
     }
 
     @JavascriptInterface
     fun getToken(): String {
+        if (!isTrustedPage()) return ""
         return prefs.getString("token", "") ?: ""
     }
 
     @JavascriptInterface
     fun saveDeviceId(deviceId: String) {
+        if (!isTrustedPage()) return
         prefs.edit().putString("device_id", deviceId).apply()
     }
 
     @JavascriptInterface
     fun getDeviceId(): String {
+        if (!isTrustedPage()) return ""
         return prefs.getString("device_id", "") ?: ""
     }
 
     @JavascriptInterface
     fun getDestinationDisplayPath(): String {
+        if (!isTrustedPage()) return ""
         val uriString = prefs.getString("destination_uri", null) ?: return ""
         return try {
             val uri = Uri.parse(uriString)
@@ -144,6 +168,7 @@ class SafBridge(
 
     @JavascriptInterface
     fun clearServerData() {
+        if (!isTrustedPage()) return
         prefs.edit().clear().apply()
         activity.runOnUiThread {
             val intent = Intent(activity, PairingActivity::class.java).apply {
@@ -156,6 +181,7 @@ class SafBridge(
 
     @JavascriptInterface
     fun pickDestinationFolder() {
+        if (!isTrustedPage()) return
         activity.runOnUiThread {
             val intent = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).apply {
                 flags = Intent.FLAG_GRANT_READ_URI_PERMISSION or
