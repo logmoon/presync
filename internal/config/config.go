@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/BurntSushi/toml"
 )
@@ -102,6 +103,10 @@ func Load() (Config, error) {
 }
 
 func SaveConfig(cfg Config) error {
+	if err := validate(cfg); err != nil {
+		return err
+	}
+
 	path := ConfigPath()
 	tmp := path + ".tmp"
 
@@ -139,10 +144,24 @@ func validate(cfg Config) error {
 		return fmt.Errorf("invalid log level %q: must be debug, info, or error", cfg.Daemon.LogLevel)
 	}
 
+	seen := make(map[string]bool, len(cfg.Profiles))
 	for _, p := range cfg.Profiles {
 		if p.Mode != "mirror" && p.Mode != "additive" {
 			return fmt.Errorf("profile %q has invalid mode %q: must be mirror or additive", p.Name, p.Mode)
 		}
+
+		// Profile names flow into session filenames and CLI/UI filters — they
+		// must be non-empty, unique, and path-safe.
+		if p.Name == "" {
+			return fmt.Errorf("profile name must not be empty")
+		}
+		if strings.ContainsAny(p.Name, "/\\") {
+			return fmt.Errorf("profile name %q must not contain path separators", p.Name)
+		}
+		if seen[p.Name] {
+			return fmt.Errorf("duplicate profile name %q", p.Name)
+		}
+		seen[p.Name] = true
 	}
 
 	return nil

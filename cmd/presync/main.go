@@ -44,6 +44,12 @@ func main() {
 		err = runSync()
 	case "connect":
 		err = runConnect()
+	case "forget":
+		address := ""
+		if len(os.Args) >= 3 {
+			address = os.Args[2]
+		}
+		err = client.ForgetServer(address)
 	case "help", "--help", "-h":
 		printUsage()
 	default:
@@ -78,8 +84,10 @@ Server commands:
                        (e.g. --to laptop --to phone)
 
 Client commands:
-  connect [url]         Pair with a server (url = pairing URL) or sync (no args)
-    --fresh             Force a new session, ignoring any resume state
+  connect [url]         Pair with a server (url with ?token=) or sync (no args).
+                        An address without a token reconnects to that stored
+                        server. --fresh forces a clean session.
+  forget [address]      Forget a paired server (first one if no address given)
 
 Other:
   help                 Show this help message`)

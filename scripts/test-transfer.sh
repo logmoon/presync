@@ -116,7 +116,7 @@ CONFIRM_RESP=$(curl -s -X POST -H "X-Presync-Token: $LOCAL_TOKEN" $BASE/pair/con
 DEVICE_ID=$(echo "$CONFIRM_RESP" | python3 -c "import sys,json; print(json.load(sys.stdin)['device_id'])")
 LONG_TOKEN=$(echo "$CONFIRM_RESP" | python3 -c "import sys,json; print(json.load(sys.stdin)['token'])")
 
-assert_eq "device ID is 8 chars" "8" "${#DEVICE_ID}"
+assert_eq "device ID is 16 chars" "16" "${#DEVICE_ID}"
 assert_eq "long token is 64 chars" "64" "${#LONG_TOKEN}"
 
 echo ""

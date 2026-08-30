@@ -210,8 +210,14 @@ func Stop() error {
 		return fmt.Errorf("finding process %d: %w", pid, err)
 	}
 
-	if err := sendStopSignal(process); err != nil {
+	// Stale PID file: process is already gone — clean it up and report stopped.
+	if !processAlive(pid) {
 		os.Remove(config.PIDPath())
+		fmt.Printf("daemon stopped (PID %d)\n", pid)
+		return nil
+	}
+
+	if err := sendStopSignal(process); err != nil {
 		return fmt.Errorf("sending stop signal to PID %d: %w", pid, err)
 	}
 
@@ -224,9 +230,10 @@ func Stop() error {
 		time.Sleep(100 * time.Millisecond)
 	}
 
-	os.Remove(config.PIDPath())
-	fmt.Printf("daemon stopped (PID %d, forced)\n", pid)
-	return nil
+	// The daemon is still alive after 5s. Keep the PID file so status reports
+	// it correctly — removing it here would let `presync start` spawn a second
+	// daemon that fails to bind while the original keeps running.
+	return fmt.Errorf("daemon (PID %d) did not stop within 5s — check the logs", pid)
 }
 
 func Status() error {

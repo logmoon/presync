@@ -92,8 +92,8 @@ func handlePairConfirm() http.HandlerFunc {
 			return
 		}
 
-		// Write destinations to config.toml keyed by the device name
-		// Look up device name by ID from devices.json
+		// Look up device name by ID from devices.json (used for the legacy
+		// name-keyed destination entries and for display).
 		df, loadErr := config.LoadDevices()
 		var deviceName string
 		if loadErr == nil {
@@ -108,14 +108,27 @@ func handlePairConfirm() http.HandlerFunc {
 			deviceName = "unknown"
 		}
 
+		// Write destinations to config.toml keyed by the device ID (stable per
+		// device), keeping a legacy name-keyed entry for pre-ID configs.
+		// The config is reloaded from disk first: the daemon's in-memory copy
+		// may be stale if the user edited config.toml while the daemon ran.
+		cfg, cfgErr := config.Load()
+		if cfgErr != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": fmt.Sprintf("reloading config: %v", cfgErr)})
+			return
+		}
+
 		if len(destinations) > 0 {
-			cfg := getConfig()
 			for i := range cfg.Profiles {
 				if cfg.Profiles[i].Destinations == nil {
 					cfg.Profiles[i].Destinations = make(map[string]string)
 				}
 				if dest, ok := destinations[cfg.Profiles[i].Name]; ok {
-					cfg.Profiles[i].Destinations[deviceName] = dest
+					cfg.Profiles[i].Destinations[deviceID] = dest
+					// Upgrade: remove the legacy name-keyed entry for this device
+					if deviceName != "" {
+						delete(cfg.Profiles[i].Destinations, deviceName)
+					}
 				}
 			}
 			if err := config.SaveConfig(cfg); err != nil {
@@ -130,15 +143,20 @@ func handlePairConfirm() http.HandlerFunc {
 					logError("creating destination directory %s: %v", dest, err)
 				}
 			}
-		} else if activeCfg != nil {
+		} else {
 			// No server-side destinations — remove any stale entry for this device
-			cfg := getConfig()
 			changed := false
 			for i := range cfg.Profiles {
 				if cfg.Profiles[i].Destinations != nil {
-					if _, ok := cfg.Profiles[i].Destinations[deviceName]; ok {
-						delete(cfg.Profiles[i].Destinations, deviceName)
+					if _, ok := cfg.Profiles[i].Destinations[deviceID]; ok {
+						delete(cfg.Profiles[i].Destinations, deviceID)
 						changed = true
+					}
+					if deviceName != "" {
+						if _, ok := cfg.Profiles[i].Destinations[deviceName]; ok {
+							delete(cfg.Profiles[i].Destinations, deviceName)
+							changed = true
+						}
 					}
 				}
 			}

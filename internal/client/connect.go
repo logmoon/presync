@@ -32,9 +32,14 @@ type profilesResponse struct {
 
 func Connect(pairingURL, destOverride string, fresh bool, progress func(path string, done bool, err error)) error {
 	if pairingURL != "" {
-		return doPairing(pairingURL, destOverride, fresh, progress)
+		// With a token it is a pairing URL; without one it selects a stored
+		// server to reconnect to.
+		if _, _, err := parsePairingURL(pairingURL); err == nil {
+			return doPairing(pairingURL, destOverride, fresh, progress)
+		}
+		return reconnectAndSync(fresh, progress, normalizeAddr(pairingURL))
 	}
-	return reconnectAndSync(fresh, progress)
+	return reconnectAndSync(fresh, progress, "")
 }
 
 func ensureHTTP(addr string) string {
@@ -42,6 +47,44 @@ func ensureHTTP(addr string) string {
 		return addr
 	}
 	return "http://" + addr
+}
+
+// normalizeAddr strips any scheme so stored addresses are plain host:port.
+func normalizeAddr(addr string) string {
+	for _, scheme := range []string{"http://", "https://"} {
+		if len(addr) > len(scheme) && addr[:len(scheme)] == scheme {
+			return addr[len(scheme):]
+		}
+	}
+	return addr
+}
+
+// ForgetServer removes a stored server entry. With an empty address the first
+// entry is removed (the one reconnect would use); otherwise the entry with a
+// matching address.
+func ForgetServer(address string) error {
+	sf, err := config.LoadServers()
+	if err != nil {
+		return fmt.Errorf("loading servers: %w", err)
+	}
+	if len(sf.Servers) == 0 {
+		return fmt.Errorf("no paired server to forget")
+	}
+
+	if address == "" {
+		if err := config.RemoveServer(sf.Servers[0].Address); err != nil {
+			return fmt.Errorf("forgetting server: %w", err)
+		}
+		fmt.Printf("Forgot server %s\n", sf.Servers[0].Address)
+		return nil
+	}
+
+	addr := normalizeAddr(address)
+	if err := config.RemoveServer(addr); err != nil {
+		return fmt.Errorf("forgetting server %s: %w", addr, err)
+	}
+	fmt.Printf("Forgot server %s\n", addr)
+	return nil
 }
 
 func doPairing(pairingURL, destOverride string, fresh bool, progress func(path string, done bool, err error)) error {
@@ -84,18 +127,26 @@ func doPairing(pairingURL, destOverride string, fresh bool, progress func(path s
 			return nil
 		}
 
-		fmt.Print("No server-side destination configured.\nWhere should files be stored? ")
-		reader := bufio.NewReader(os.Stdin)
-		input, _ := reader.ReadString('\n')
-		baseDir := strings.TrimSpace(input)
+		if destOverride != "" {
+			// Client-side destination chosen on the command line
+			destinations = make(map[string]string)
+			for _, name := range profiles {
+				destinations[name] = filepath.Join(destOverride, name)
+			}
+		} else {
+			fmt.Print("No server-side destination configured.\nWhere should files be stored? ")
+			reader := bufio.NewReader(os.Stdin)
+			input, _ := reader.ReadString('\n')
+			baseDir := strings.TrimSpace(input)
 
-		if baseDir == "" {
-			return fmt.Errorf("no destination specified")
-		}
+			if baseDir == "" {
+				return fmt.Errorf("no destination specified")
+			}
 
-		destinations = make(map[string]string)
-		for _, name := range profiles {
-			destinations[name] = filepath.Join(baseDir, name)
+			destinations = make(map[string]string)
+			for _, name := range profiles {
+				destinations[name] = filepath.Join(baseDir, name)
+			}
 		}
 	}
 
@@ -110,6 +161,10 @@ func doPairing(pairingURL, destOverride string, fresh bool, progress func(path s
 			Name:        name,
 			Destination: path,
 		})
+	}
+
+	if err := config.EnsureDirs(); err != nil {
+		return fmt.Errorf("preparing client config directory: %w", err)
 	}
 
 	if err := config.SaveServer(entry); err != nil {
@@ -147,7 +202,7 @@ func doPairing(pairingURL, destOverride string, fresh bool, progress func(path s
 	return nil
 }
 
-func reconnectAndSync(fresh bool, progress func(path string, done bool, err error)) error {
+func reconnectAndSync(fresh bool, progress func(path string, done bool, err error), address string) error {
 	sf, err := config.LoadServers()
 	if err != nil {
 		return fmt.Errorf("loading servers: %w", err)
@@ -157,7 +212,21 @@ func reconnectAndSync(fresh bool, progress func(path string, done bool, err erro
 		return fmt.Errorf("no paired server — run 'presync connect <pairing-url>' first")
 	}
 
-	entry := sf.Servers[0]
+	var entry *config.ServerEntry
+	if address != "" {
+		for i := range sf.Servers {
+			if sf.Servers[i].Address == address {
+				entry = &sf.Servers[i]
+				break
+			}
+		}
+		if entry == nil {
+			return fmt.Errorf("no stored pairing for server %q — run 'presync connect <pairing-url>' first", address)
+		}
+	} else {
+		entry = &sf.Servers[0]
+	}
+
 	serverAddr := entry.Address
 	token := entry.Token
 	deviceID := entry.DeviceID
@@ -232,6 +301,12 @@ func parsePairingURL(raw string) (serverAddr, sessionToken string, err error) {
 	u, err := url.Parse(raw)
 	if err != nil {
 		return "", "", fmt.Errorf("invalid URL: %w", err)
+	}
+
+	// Only http/https pairing URLs are accepted. Anything else (file://,
+	// javascript:, ...) is a phishing or injection vector.
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return "", "", fmt.Errorf("invalid pairing URL scheme %q: must be http or https", u.Scheme)
 	}
 
 	host := u.Host
@@ -327,6 +402,14 @@ func pollPairConfirmed(serverAddr, sessionToken string, timeout time.Duration) (
 		resp, err := c.Get(fmt.Sprintf("http://%s/pair/confirmed?token=%s", serverAddr, url.QueryEscape(sessionToken)))
 		if err != nil {
 			continue
+		}
+
+		// Non-OK responses are real failures (rejected session, server error),
+		// not "not yet confirmed" — surface them instead of masking as a timeout.
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			return "", "", nil, fmt.Errorf("pairing status request failed (%d): %s", resp.StatusCode, strings.TrimSpace(string(body)))
 		}
 
 		var result pairConfirmedResponse

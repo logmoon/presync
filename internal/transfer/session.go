@@ -350,3 +350,29 @@ func DeleteSession(path string) error {
 	}
 	return nil
 }
+
+// DeleteSessionsForDevice removes every session file belonging to a device,
+// used when the device is unpaired.
+func DeleteSessionsForDevice(deviceID string) error {
+	dir := config.SessionsDir()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("reading sessions directory: %w", err)
+	}
+
+	prefix := sanitizeName(deviceID) + "-"
+	for _, e := range entries {
+		if e.IsDir() || filepath.Ext(e.Name()) != ".json" {
+			continue
+		}
+		if strings.HasPrefix(e.Name(), prefix) {
+			if err := os.Remove(filepath.Join(dir, e.Name())); err != nil && !os.IsNotExist(err) {
+				return fmt.Errorf("deleting session %s: %w", e.Name(), err)
+			}
+		}
+	}
+	return nil
+}

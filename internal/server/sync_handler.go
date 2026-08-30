@@ -133,8 +133,13 @@ func handleSyncStart() http.HandlerFunc {
 		case req.DeviceID == webDeviceID:
 			// no override
 		default:
-			if deviceName != "" && profile.Destinations != nil {
-				destination = profile.Destinations[deviceName]
+			if profile.Destinations != nil {
+				// Device-ID keyed entry (current), then legacy name key.
+				if d, ok := profile.Destinations[req.DeviceID]; ok {
+					destination = d
+				} else if deviceName != "" {
+					destination = profile.Destinations[deviceName]
+				}
 			}
 		}
 

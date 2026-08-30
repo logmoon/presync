@@ -16,6 +16,7 @@ import (
 	qrcode "github.com/skip2/go-qrcode"
 
 	"presync/internal/config"
+	"presync/internal/transfer"
 )
 
 func localIP() string {
@@ -165,6 +166,37 @@ func Unpair() error {
 	dev := df.Devices[choice-1]
 	if err := config.RemoveDevice(dev.ID); err != nil {
 		return fmt.Errorf("removing device: %w", err)
+	}
+
+	// Clean up the departed device's destination entries (by ID and legacy
+	// name key) so syncs stop targeting its path.
+	cfg, err := config.Load()
+	if err != nil {
+		return fmt.Errorf("loading config for cleanup: %w", err)
+	}
+	changed := false
+	for i := range cfg.Profiles {
+		if cfg.Profiles[i].Destinations == nil {
+			continue
+		}
+		if _, ok := cfg.Profiles[i].Destinations[dev.ID]; ok {
+			delete(cfg.Profiles[i].Destinations, dev.ID)
+			changed = true
+		}
+		if _, ok := cfg.Profiles[i].Destinations[dev.Name]; ok {
+			delete(cfg.Profiles[i].Destinations, dev.Name)
+			changed = true
+		}
+	}
+	if changed {
+		if err := config.SaveConfig(cfg); err != nil {
+			logError("cleaning destinations after unpair: %v", err)
+		}
+	}
+
+	// Delete the device's session files
+	if err := transfer.DeleteSessionsForDevice(dev.ID); err != nil {
+		logError("cleaning sessions after unpair: %v", err)
 	}
 
 	fmt.Printf("Device %q (ID: %s) removed.\n", dev.Name, dev.ID)

@@ -50,6 +50,11 @@ type syncConfirmResponse struct {
 func SyncProfile(serverAddr, token, profileName, deviceID, destDir string, fresh bool, progress func(path string, done bool, err error)) (SyncResult, error) {
 	c := &http.Client{Timeout: 0}
 
+	// The destination may not exist yet (fresh pairing, --dest path)
+	if err := os.MkdirAll(destDir, 0o755); err != nil {
+		return SyncResult{}, fmt.Errorf("creating destination directory: %w", err)
+	}
+
 	destManifest, err := diff.BuildManifest(destDir)
 	if err != nil {
 		return SyncResult{}, fmt.Errorf("building destination manifest: %w", err)

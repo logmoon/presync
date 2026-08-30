@@ -92,7 +92,7 @@ func AddDevice(name, token string) (Device, error) {
 		return Device{}, err
 	}
 
-	id, err := generateID()
+	id, err := generateID(df.Devices)
 	if err != nil {
 		return Device{}, fmt.Errorf("generating device ID: %w", err)
 	}
@@ -150,12 +150,23 @@ func ValidateToken(token string) (Device, bool) {
 	return Device{}, false
 }
 
-func generateID() (string, error) {
-	b := make([]byte, 4)
-	if _, err := rand.Read(b); err != nil {
-		return "", err
+func generateID(existing []Device) (string, error) {
+	seen := make(map[string]bool, len(existing))
+	for _, d := range existing {
+		seen[d.ID] = true
 	}
-	return hex.EncodeToString(b), nil
+
+	for attempt := 0; attempt < 10; attempt++ {
+		b := make([]byte, 8)
+		if _, err := rand.Read(b); err != nil {
+			return "", err
+		}
+		id := hex.EncodeToString(b)
+		if !seen[id] {
+			return id, nil
+		}
+	}
+	return "", fmt.Errorf("could not generate a unique device ID")
 }
 
 func GenerateToken() (string, error) {
