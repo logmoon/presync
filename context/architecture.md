@@ -68,7 +68,7 @@ presync/
 | `internal/diff` | Manifest building, delta computation | Perform any network or disk I/O — pure computation over two manifests in, a delta out |
 | `internal/transfer` | Chunked transfer, checksum verification, resume | Decide *which* files to transfer — that's `diff`'s output, `transfer` only executes it |
 | `internal/pairing` | QR rendering, PIN confirmation, token issuance | Touch sync/transfer logic in any way |
-| `internal/config` | Reading/writing `config.toml`, `devices.json`, session files | Be bypassed — no other package reads or writes these files directly |
+| `internal/config` | Reading/writing `config.toml`, `devices.json`, `servers.json`, `local-token` | Be bypassed — no other package reads or writes these files directly. Session file CRUD is owned by `internal/transfer` (see invariant 11) |
 | `web/` | UI rendering only | Call into Go directly — it only ever talks to the server via HTTP endpoints |
 | `android/` | WebView shell, SAF file operations exposed via JS bridge | Contain sync logic — that lives entirely in the loaded web UI / server |
 
@@ -124,10 +124,11 @@ None. State is stored as flat files, owned exclusively by `internal/config`:
 ## Authentication
 
 - **Provider:** none external — presync issues and validates its own tokens.
-- **Pairing handshake:** QR-encoded single-use session token (60s TTL) + a 4-digit PIN both sides display and the user confirms manually. This is the only point requiring human interaction.
+- **Pairing handshake:** QR-encoded single-use session token (60s TTL) + a 4-digit PIN both sides display and the user confirms manually. This is the only point requiring human interaction. The session token is consumed on first `/pair/accept` — a second device scanning the same QR is rejected.
 - **Steady state:** client sends its stored 256-bit long-lived token on every request; server validates against `devices.json`. No QR, no PIN, no further confirmation.
-- **Protected routes:** every endpoint except `/pair` and the static APK download requires a valid token.
-- **Revocation:** `presync unpair` removes the device from `devices.json`; its token is rejected on the very next request — no grace period.
+- **Protected routes:** every endpoint except `/pair`, `/pair/accept`, `/pair/confirmed` (session-token bound), `/pair/destinations` (session-token bound), `/web/token` (scoped bootstrap), and static files requires a valid token.
+- **Token scoping:** the local token served by `/web/token` is only accepted on web-UI routes (`/web/*`, `/profiles/*`, `/status`) and — over loopback only — on `/sync*` (the CLI's self-sync). A remote caller can never use it to download files. Pairing admin actions (`/pair/confirm`, `/pair/discard`, `/pair/status`, `/reload`) require the local token **and** a loopback connection.
+- **Revocation:** `presync unpair` removes the device from `devices.json`; its token is rejected on the very next request — no grace period. Unpair also removes the device's destination entries from `config.toml` and deletes its session files.
 - **Transport:** plain HTTP on the LAN for Phase 1 (documented, accepted risk for a personal local tool). HTTPS with a self-signed cert is a Phase 3 addition — no Phase 1/2 code should assume or hardcode `https://`.
 
 ## Invariants
@@ -135,12 +136,12 @@ None. State is stored as flat files, owned exclusively by `internal/config`:
 1. The server is always the source of truth — clients never push file changes back; they only ever report manifests of what they currently have.
 2. A file is never marked synced until the client-reported SHA-256 hash matches the server's hash for that file — a mismatch always triggers a retry (max 3), never silent acceptance.
 3. In-progress transfers always write to `<filename>.presync-tmp`. The real filename only ever appears via an atomic rename, and only after checksum verification passes.
-4. `mirror` mode deletions on the recipient happen only after the full delta for that sync is known; `additive` profiles never delete a recipient file under any circumstance.
-5. The QR pairing token is single-use and expires after 60 seconds; the long-lived token is a 256-bit random value, generated once per device at confirmed pairing.
-6. Unpairing a device invalidates its token immediately on the server — no cached or delayed validity anywhere in the request path.
-7. The server never assumes anything about the destination filesystem's shape — `destination` path interpretation belongs entirely to the client (plain path on PC, SAF URI on Android).
+4. `mirror` mode deletions on the recipient happen only after the full delta for that sync is known (the resume path recomputes the delta so deletions are still delivered); `additive` profiles never delete a recipient file under any circumstance.
+5. The QR pairing token is single-use (consumed on first `/pair/accept`) and expires after 60 seconds; the long-lived token is a 256-bit random value, generated once per device at confirmed pairing.
+6. Unpairing a device invalidates its token immediately on the server — no cached or delayed validity anywhere in the request path. Unpair also removes the device's destination entries and session files.
+7. The server never assumes anything about the destination filesystem's shape — `destination` path interpretation belongs entirely to the client (plain path on PC, SAF URI on Android). The server's `Destinations` map is keyed by device ID; resolution falls back to the legacy name key.
 8. `internal/diff` performs zero network or disk I/O — it is pure computation over two manifests in, a delta out, and must stay unit-testable without mocks.
 9. A sync must be resumable purely by reading the session JSON plus checking the in-progress temp file's byte count — no other hidden in-memory state is allowed to be required for resume correctness.
 10. No Phase 1 or Phase 2 code path hardcodes or assumes an `https://` scheme; transport is plain HTTP by design until Phase 3.
-11. `internal/config` is the only package permitted to read or write `config.toml`, `devices.json`, or session files directly — all other packages go through it.
-12. Stale session files older than 7 days are pruned on server start, and `presync sync --fresh` must always be honored as "ignore any existing session, start clean" regardless of session age.
+11. `internal/config` is the only package permitted to read or write `config.toml`, `devices.json`, `servers.json`, and `local-token` directly; `internal/transfer` owns all session-file CRUD (via `config.SessionsDir()`). All other packages go through these two.
+12. Stale session files older than 7 days are pruned on server start, and `presync sync --fresh` must always be honored as "ignore any existing session, start clean" regardless of session age. The `fresh` flag is also honored server-side for remote clients. Incomplete sessions are considered stale (and resumable state discarded) after 30 minutes of inactivity.

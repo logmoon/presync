@@ -46,6 +46,50 @@ func TestAddAndRemoveDevice(t *testing.T) {
 	}
 }
 
+func TestTokenRevocationImmediate(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("PRESYNC_CONFIG_DIR", dir)
+
+	dev, err := AddDevice("revoke-me", "token-to-revoke")
+	if err != nil {
+		t.Fatalf("AddDevice: %v", err)
+	}
+
+	if _, ok := ValidateToken("token-to-revoke"); !ok {
+		t.Fatal("expected token valid before unpair")
+	}
+
+	if err := RemoveDevice(dev.ID); err != nil {
+		t.Fatalf("RemoveDevice: %v", err)
+	}
+
+	// Invariant 6: unpairing invalidates the token immediately — the very next
+	// validation must fail, with no cached validity anywhere.
+	if _, ok := ValidateToken("token-to-revoke"); ok {
+		t.Fatal("expected token rejected immediately after unpair")
+	}
+}
+
+func TestDeviceIDUniqueness(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("PRESYNC_CONFIG_DIR", dir)
+
+	ids := make(map[string]bool)
+	for i := 0; i < 25; i++ {
+		dev, err := AddDevice("device", "token")
+		if err != nil {
+			t.Fatalf("AddDevice: %v", err)
+		}
+		if len(dev.ID) != 16 {
+			t.Errorf("expected 16-char device ID, got %d chars: %s", len(dev.ID), dev.ID)
+		}
+		if ids[dev.ID] {
+			t.Fatalf("duplicate device ID generated: %s", dev.ID)
+		}
+		ids[dev.ID] = true
+	}
+}
+
 func TestValidateToken(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("PRESYNC_CONFIG_DIR", dir)

@@ -3,8 +3,8 @@
 ## Current Status
 
 **Phase:** Phase 2 — Polish
-**Last completed:** 11 Per-profile sync modes (mirror / additive)
-**Next:** 12 Auto-sync on same network
+**Last completed:** Security hardening + sync engine overhaul (review fixes)
+**Next:** 12 Auto-sync on same network (still the next planned task)
 
 ---
 
@@ -69,6 +69,25 @@ _Add decisions here as they are made during implementation._
 - **`/pair/confirmed` returns token from last 30s** — `pairing.go` stores `lastConfirmedDeviceID/Token` after confirm.
 - **`androidSyncActive` flag** — prevents `renderProgress` from polling server sessions during Android client-driven sync.
 - **SPA fallback uses `http.ServeContent`** not `http.FileServer` — serves `index.html` for any path not matching a real file.
+- **Auth middleware split** (Phase 1): `withAuth` (device tokens, + local token over loopback only) on `/sync*`; `withWebAuth` (device or local) on `/web/*`, `/profiles/*`, `/status`; `withLocalAdmin` (loopback + local token) on `/pair/confirm|discard|status`, `/reload`. The unauthenticated `/web/token` bootstrap can never yield file-download capability remotely.
+- **Pairing session-token binding** (Phase 1): `/pair/confirmed` and `/pair/destinations` require the QR session token; QR token is consumed on first `/pair/accept` (single-use, invariant 5 now enforced).
+- **Local token atomicity** (Phase 1): `O_CREATE|O_EXCL` create + race-loser re-reads winner; truncated/corrupt files are healed; only 64-char hex tokens accepted.
+- **Session identifiers confined** (Phase 1): `transfer.ResolveSession` maps client-supplied session values to basenames inside `SessionsDir`; `device_id`/`profile` with path separators rejected at `/sync` start.
+- **Stuck-in_progress fix** (Phase 2): `handleSyncFile` validates source + hashes BEFORE marking `in_progress`; offset > size → 416; failures leave the file pending. New `POST /sync/error` lets clients mark a file errored after retries (state machine terminal). `PendingFiles()` counts `in_progress`.
+- **In-run retry** (Phase 2): clients retry each file up to `MaxRetries` within one run; `error`-state files stay re-fetchable on later runs (per-run cap).
+- **Server-side `--fresh`** (Phase 2): `fresh` field in `/sync` body; works for remote clients. `connect --fresh` allowed on reconnect.
+- **SHA-256 ambiguity fallback** (Phase 2): fresh sessions include size+mtime-identical files with server-computed hashes; clients verify their local copy and confirm without transfer when it matches.
+- **Mirror deletions executed** (Phase 2): resume recomputes the delta (deletions delivered on resume); PC client + Android bridge (`deleteFile`) apply `delta.to_delete` after the file phase.
+- **Staleness 30 min** (Phase 2): `activeSessionTimeout` 60s → 30 min so interrupted syncs survive; `/web/sessions` delete-gate uses it.
+- **`/web/sync` real deltas** (Phase 3): no pre-created full-profile sessions; the background `SyncProfile` computes the delta; guard moved before state creation (double-trigger → 409).
+- **Destination resolution rules** (Phase 3/4): `"local"` only for `deviceID=="local"`; webDeviceID gets no override; registered devices resolve by device ID (legacy name-key fallback); unregistered devices keep their own path — the old "local" fallback that misdirected remote clients is gone.
+- **Android chunked transfer** (Phase 3): 512KB ReadableStream chunks → `writeChunk` (append to `.presync-tmp`) → `finishFile` returns the native SHA-256 (real end-to-end verification, no more echoing the server header) → confirm → `renameFile` only on success; `abortFile` on failure; resume from `tempFileSize` + offset. `buildManifest` (recursive SAF walk) sends real destination manifests.
+- **Android lifecycle** (Phase 3): transient errors show a Retry screen — never auto-wipe pairing data/SAF grant; persistable URI grant released on forget; `allowBackup=false`; `allowFileAccess=false`; cross-origin navigation blocked; bridge origin-gated.
+- **`presync forget [address]`** (Phase 4): first production caller of `RemoveServer`; `connect <address>` (no token) reconnects to that stored server instead of always `servers[0]`.
+- **Destinations keyed by device ID** (Phase 4): pairing writes `Destinations[deviceID]`; legacy name keys upgraded on confirm and honored in resolution.
+- **Unpair cleanup** (Phase 4): removes destination entries (ID + name keys) and deletes the device's session files.
+- **SaveConfig validates** (Phase 4): mode/port/log-level/empty/duplicate/path-unsafe profile names rejected before write; pair confirm reloads config from disk before mutating (no stale in-memory clobber).
+- **Device IDs 8 bytes** (Phase 4): 16 hex chars, collision-checked on add.
 
 ---
 

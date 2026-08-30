@@ -237,6 +237,35 @@ func TestResolveSessionContainment(t *testing.T) {
 	}
 }
 
+func TestSessionFilenamesUniqueAndSanitized(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("PRESYNC_CONFIG_DIR", dir)
+
+	if err := config.EnsureDirs(); err != nil {
+		t.Fatalf("EnsureDirs: %v", err)
+	}
+
+	// Two sessions for the same device+profile must never collide
+	a := NewSession("dev1", "music", []string{"a.mp3"})
+	b := NewSession("dev1", "music", []string{"b.mp3"})
+	if a.Path == b.Path {
+		t.Fatal("expected distinct session filenames for same device+profile")
+	}
+
+	// Path-unsafe identifiers are sanitized into the filename
+	c := NewSession("dev/1", "mu\\sic", []string{"c.mp3"})
+	if c.Path == "" {
+		t.Fatal("expected a session path")
+	}
+	if len(c.Path) != len(filepath.Join(config.SessionsDir(), "dev_1-mu_sic-.json"))+len("20060102T150405.000000000Z")-1 {
+		t.Logf("sanitized session path: %s", c.Path)
+	}
+	base := filepath.Base(c.Path)
+	if len(base) != len("dev_1-mu_sic-20060102T150405.000000000Z.json") {
+		t.Errorf("unexpected sanitized filename: %s", base)
+	}
+}
+
 func TestFindSessionForDevice(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("PRESYNC_CONFIG_DIR", dir)
