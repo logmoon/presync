@@ -9,6 +9,7 @@ import android.webkit.WebView
 import androidx.documentfile.provider.DocumentFile
 import org.json.JSONArray
 import org.json.JSONObject
+import java.security.MessageDigest
 import java.util.Base64
 
 class SafBridge(
@@ -28,144 +29,6 @@ class SafBridge(
         val origin = trustedOrigin ?: return false
         val url = webView.url ?: return false
         return url.startsWith(origin)
-    }
-
-    @JavascriptInterface
-    fun writeFile(path: String, base64Data: String, callback: String) {
-        if (!isTrustedPage()) {
-            invokeCallback(callback, false, "Untrusted page")
-            return
-        }
-        try {
-            val treeUri = getDestinationUri() ?: run {
-                invokeCallback(callback, false, "No destination folder selected")
-                return
-            }
-
-            val documentFile = DocumentFile.fromTreeUri(activity, treeUri)
-                ?: run {
-                    invokeCallback(callback, false, "Cannot access destination folder")
-                    return
-                }
-
-            val parts = path.split("/")
-            var currentDir = documentFile
-
-            for (i in 0 until parts.size - 1) {
-                val dirName = parts[i]
-                currentDir = currentDir.findFile(dirName)
-                    ?: currentDir.createDirectory(dirName)
-                    ?: run {
-                        invokeCallback(callback, false, "Failed to create directory: $dirName")
-                        return
-                    }
-            }
-
-            val fileName = parts.last()
-            val data = Base64.getDecoder().decode(base64Data)
-
-            val existingFile = currentDir.findFile(fileName)
-            if (existingFile != null && existingFile.isFile) {
-                existingFile.delete()
-            }
-
-            val targetFile = currentDir.createFile("application/octet-stream", fileName)
-                ?: run {
-                    invokeCallback(callback, false, "Failed to create file: $fileName")
-                    return
-                }
-
-            activity.contentResolver.openOutputStream(targetFile.uri)?.use { out ->
-                out.write(data)
-            } ?: run {
-                invokeCallback(callback, false, "Failed to write file: $fileName")
-                return
-            }
-
-            invokeCallback(callback, true, "OK")
-        } catch (e: Exception) {
-            invokeCallback(callback, false, e.message ?: "Unknown error")
-        }
-    }
-
-    @JavascriptInterface
-    fun listDestination(@Suppress("UNUSED_PARAMETER") profileName: String, callback: String) {
-        if (!isTrustedPage()) {
-            invokeCallback(callback, false, "Untrusted page")
-            return
-        }
-        try {
-            val treeUri = getDestinationUri()
-            if (treeUri == null) {
-                invokeCallback(callback, false, "No destination folder selected")
-                return
-            }
-
-            val documentFile = DocumentFile.fromTreeUri(activity, treeUri)
-            if (documentFile == null || !documentFile.exists()) {
-                invokeCallback(callback, false, "Destination folder not accessible")
-                return
-            }
-
-            val files = JSONArray()
-            for (file in documentFile.listFiles()) {
-                if (file.isFile) {
-                    files.put(file.name ?: "unknown")
-                }
-            }
-
-            val result = JSONObject().apply {
-                put("files", files)
-            }
-            invokeCallback(callback, true, result.toString())
-        } catch (e: Exception) {
-            invokeCallback(callback, false, e.message ?: "Unknown error")
-        }
-    }
-
-    @JavascriptInterface
-    fun deleteFile(path: String, callback: String) {
-        if (!isTrustedPage()) {
-            invokeCallback(callback, false, "Untrusted page")
-            return
-        }
-        try {
-            val treeUri = getDestinationUri() ?: run {
-                invokeCallback(callback, false, "No destination folder selected")
-                return
-            }
-
-            val documentFile = DocumentFile.fromTreeUri(activity, treeUri)
-                ?: run {
-                    invokeCallback(callback, false, "Cannot access destination folder")
-                    return
-                }
-
-            val parts = path.split("/")
-            var currentDir = documentFile
-            for (i in 0 until parts.size - 1) {
-                currentDir = currentDir.findFile(parts[i])
-                    ?: run {
-                        // Parent missing — the file is already gone
-                        invokeCallback(callback, true, "OK")
-                        return
-                    }
-            }
-
-            val target = currentDir.findFile(parts.last())
-            if (target == null || !target.exists()) {
-                invokeCallback(callback, true, "OK")
-                return
-            }
-            if (!target.delete()) {
-                invokeCallback(callback, false, "Failed to delete: ${parts.last()}")
-                return
-            }
-
-            invokeCallback(callback, true, "OK")
-        } catch (e: Exception) {
-            invokeCallback(callback, false, e.message ?: "Unknown error")
-        }
     }
 
     @JavascriptInterface
@@ -214,6 +77,7 @@ class SafBridge(
     @JavascriptInterface
     fun clearServerData() {
         if (!isTrustedPage()) return
+        releaseDestinationGrant()
         prefs.edit().clear().apply()
         activity.runOnUiThread {
             val intent = Intent(activity, PairingActivity::class.java).apply {
@@ -239,14 +103,31 @@ class SafBridge(
 
     fun handleDestinationPicked(uri: Uri?) {
         if (uri != null) {
-            activity.contentResolver.takePersistableUriPermission(
-                uri,
-                Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
-            )
+            try {
+                activity.contentResolver.takePersistableUriPermission(
+                    uri,
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+                )
+            } catch (e: Exception) {
+                // Provider does not support persistable grants — the grant is
+                // still valid for this session; do not crash the app.
+            }
             prefs.edit().putString("destination_uri", uri.toString()).apply()
             invokeCallbackOnWebView("onDestinationPicked", true, uri.toString())
         } else {
             invokeCallbackOnWebView("onDestinationPicked", false, "Cancelled")
+        }
+    }
+
+    private fun releaseDestinationGrant() {
+        val uriString = prefs.getString("destination_uri", null) ?: return
+        try {
+            activity.contentResolver.releasePersistableUriPermission(
+                Uri.parse(uriString),
+                Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+            )
+        } catch (e: Exception) {
+            // Nothing to release — ignore
         }
     }
 

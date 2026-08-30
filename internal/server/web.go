@@ -11,7 +11,6 @@ import (
 
 	"presync/internal/client"
 	"presync/internal/config"
-	"presync/internal/diff"
 	"presync/internal/transfer"
 )
 
@@ -115,8 +114,6 @@ func handleWebSync() http.HandlerFunc {
 			return
 		}
 
-		cfg := getConfig()
-
 		var req struct {
 			Profile      string   `json:"profile"`
 			Destinations []string `json:"destinations"`
@@ -131,6 +128,7 @@ func handleWebSync() http.HandlerFunc {
 			return
 		}
 
+		cfg := getConfig()
 		var profile *config.Profile
 		for i := range cfg.Profiles {
 			if cfg.Profiles[i].Name == req.Profile {
@@ -148,72 +146,39 @@ func handleWebSync() http.HandlerFunc {
 			return
 		}
 
-		existing, _ := transfer.FindSessionForDevice(webDeviceID, req.Profile)
-		if existing != nil && !existing.IsComplete() {
-			if existing.IsStale() {
-				transfer.DeleteSession(existing.Path)
-			} else {
-				writeJSON(w, http.StatusOK, map[string]interface{}{
-					"ok":      true,
-					"session": existing.Path,
-					"files":   len(existing.Files),
-				})
-				return
-			}
-		}
-
-		manifest, err := diff.BuildManifest(profile.Source)
-		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": fmt.Sprintf("failed to read source: %v", err)})
-			return
-		}
-
-		var filePaths []string
-		for _, f := range manifest.Files {
-			filePaths = append(filePaths, f.Path)
-		}
-
-		sess := transfer.NewSession(webDeviceID, req.Profile, filePaths)
-		if err := sess.Save(); err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to create session"})
+		// Guard BEFORE creating any state, so two concurrent triggers can never
+		// orphan a session that no goroutine drives.
+		if _, loaded := webSyncActive.LoadOrStore(req.Profile, true); loaded {
+			writeJSON(w, http.StatusConflict, map[string]string{"error": "a sync is already running for this profile"})
 			return
 		}
 
 		serverAddr := fmt.Sprintf("http://localhost:%d", cfg.Daemon.Port)
-		token, _ := config.GetLocalToken()
-		sessionPath := sess.Path
-		profileName := profile.Name
-
-		// Guard: skip if a web sync is already in progress for this profile
-		if _, loaded := webSyncActive.LoadOrStore(profileName, true); loaded {
-			writeJSON(w, http.StatusOK, map[string]interface{}{
-				"ok":      true,
-				"session": sessionPath,
-				"files":   len(filePaths),
-			})
+		token, err := config.GetLocalToken()
+		if err != nil {
+			webSyncActive.Delete(req.Profile)
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to get local token"})
 			return
 		}
 
-		// Sync to selected destinations in background
+		// The session is created by SyncProfile's /sync call, which computes
+		// the real delta against the destination manifest — no pre-created
+		// full-profile sessions.
 		go func() {
-			defer webSyncActive.Delete(profileName)
+			defer webSyncActive.Delete(req.Profile)
 			for destName, destPath := range profile.Destinations {
 				if len(req.Destinations) > 0 && !webDestContains(req.Destinations, destName) {
 					continue
 				}
-				logInfo("web sync: profile=%s dest=%s path=%s", profileName, destName, destPath)
-				_, err := client.SyncProfile(serverAddr, token, profileName, webDeviceID, destPath, false, nil)
+				logInfo("web sync: profile=%s dest=%s path=%s", req.Profile, destName, destPath)
+				_, err := client.SyncProfile(serverAddr, token, req.Profile, webDeviceID, destPath, false, nil)
 				if err != nil {
-					logError("web sync failed for profile %s dest %s: %v", profileName, destName, err)
+					logError("web sync failed for profile %s dest %s: %v", req.Profile, destName, err)
 				}
 			}
 		}()
 
-		writeJSON(w, http.StatusOK, map[string]interface{}{
-			"ok":      true,
-			"session": sessionPath,
-			"files":   len(filePaths),
-		})
+		writeJSON(w, http.StatusOK, map[string]interface{}{"ok": true})
 	}
 }
 

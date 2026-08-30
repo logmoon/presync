@@ -232,8 +232,8 @@
         if (isAndroid()) {
             syncToDevice(profileName, btn);
         } else {
-            api("POST", "/web/sync", { profile: profileName, destinations: selected }).then(function (data) {
-                currentSession = data.session;
+            api("POST", "/web/sync", { profile: profileName, destinations: selected }).then(function () {
+                currentSession = "web";
                 showProgressTab(true);
                 setProgressPulse(true);
                 navigate("progress");
@@ -263,10 +263,27 @@
     }
 
     function doSyncToDevice(profileName, btn, deviceId) {
+        // Build a real destination manifest so the server computes a delta.
+        // A missing folder or manifest failure falls back to an empty manifest
+        // (full sync) rather than failing the whole sync.
+        window.AndroidBridge.buildManifest(profileName, function (result) {
+            var manifest = { files: [] };
+            if (result.success) {
+                try {
+                    manifest = JSON.parse(result.data);
+                } catch (e) {
+                    manifest = { files: [] };
+                }
+            }
+            startAndroidSync(profileName, btn, deviceId, manifest);
+        });
+    }
+
+    function startAndroidSync(profileName, btn, deviceId, destManifest) {
         var body = {
             device_id: deviceId,
             profile: profileName,
-            destination_manifest: { files: [] }
+            destination_manifest: destManifest
         };
 
         var opts = {
@@ -277,13 +294,6 @@
             },
             body: JSON.stringify(body)
         };
-
-        var abortController = null;
-        if (typeof AbortController !== "undefined") {
-            abortController = new AbortController();
-            opts.signal = abortController.signal;
-            setTimeout(function () { abortController.abort(); }, 30000);
-        }
 
         fetch("/sync", opts).then(function (res) {
             var ct = res.headers.get("content-type") || "";
@@ -318,31 +328,7 @@
 
             function syncNext() {
                 if (done + errors >= files.length) {
-                    // Mirror-mode deletions: apply after the file phase, when
-                    // the full delta is known (server only sends to_delete for
-                    // mirror profiles).
-                    applyDeletions(profileName, delta, function () {
-                        fetch("/sync/complete", {
-                            method: "POST",
-                            headers: {
-                                "Content-Type": "application/json",
-                                "X-Presync-Token": token
-                            },
-                            body: JSON.stringify({ session: sessionPath })
-                        }).then(function (res) {
-                            return res.json().then(function (data) {
-                                if (!res.ok) throw new Error(data.error || "complete failed");
-                                return data;
-                            });
-                        }).then(function () {
-                            androidSyncActive = false;
-                            setProgressPulse(false);
-                            updateSyncProgress(profileName, done, files.length, errors);
-                        }).catch(function () {
-                            androidSyncActive = false;
-                            setProgressPulse(false);
-                        });
-                    });
+                    finishAndroidSync(profileName, sessionPath, delta, done, files.length, errors);
                     return;
                 }
 
@@ -357,59 +343,12 @@
                 }
 
                 updateSyncProgress(profileName, done, files.length, errors);
-
-                fetch("/sync/file?session=" + encodeURIComponent(sessionPath) + "&path=" + encodeURIComponent(f.path), {
-                    headers: { "X-Presync-Token": token }
-                }).then(function (res) {
-                    if (!res.ok) throw new Error("fetch failed");
-                    var sha256 = res.headers.get("X-Presync-SHA256");
-                    return res.arrayBuffer().then(function (buf) {
-                        var bytes = new Uint8Array(buf);
-                        var binary = "";
-                        for (var i = 0; i < bytes.length; i++) {
-                            binary += String.fromCharCode(bytes[i]);
-                        }
-                        var b64 = btoa(binary);
-                        return { b64: b64, sha256: sha256, path: f.path };
-                    });
-                }).then(function (info) {
-                    var callbackName = "_sync_cb_" + Date.now();
-                    window[callbackName] = function (result) {
-                        delete window[callbackName];
-                        if (result.success) {
-                            var confirmBody = JSON.stringify({
-                                session: sessionPath,
-                                path: info.path,
-                                sha256: info.sha256
-                            });
-                            fetch("/sync/confirm", {
-                                method: "POST",
-                                headers: {
-                                    "Content-Type": "application/json",
-                                    "X-Presync-Token": token
-                                },
-                                body: confirmBody
-                            }).then(function (res) {
-                                return res.json();
-                            }).then(function (confirmResult) {
-                                if (confirmResult.ok) {
-                                    done++;
-                                } else {
-                                    errors++;
-                                }
-                                syncNext();
-                            }).catch(function () {
-                                errors++;
-                                syncNext();
-                            });
-                        } else {
-                            errors++;
-                            syncNext();
-                        }
-                    };
-                    window.AndroidBridge.writeFile(profileName + "/" + info.path, info.b64, callbackName);
-                }).catch(function () {
-                    errors++;
+                fetchAndroidFile(profileName, sessionPath, f.path, function (ok) {
+                    if (ok) {
+                        done++;
+                    } else {
+                        errors++;
+                    }
                     syncNext();
                 });
             }
@@ -419,6 +358,192 @@
             btn.disabled = false;
             btn.textContent = "Sync Now";
             alert(err.error || "Failed to start sync");
+        });
+    }
+
+    // Streams one file from the server in bounded chunks through the Android
+    // bridge, verifies the SHA-256 natively, renames on confirmed success.
+    function fetchAndroidFile(profileName, sessionPath, filePath, onDone) {
+        var bridgePath = profileName + "/" + filePath;
+        var CHUNK_BYTES = 512 * 1024;
+
+        function fail() {
+            window.AndroidBridge.abortFile(bridgePath, function () {
+                onDone(false);
+            });
+        }
+
+        window.AndroidBridge.tempFileSize(bridgePath, function (sizeRes) {
+            var offset = 0;
+            if (sizeRes.success) {
+                try {
+                    offset = parseInt(sizeRes.data, 10) || 0;
+                } catch (e) {
+                    offset = 0;
+                }
+            }
+
+            var url = "/sync/file?session=" + encodeURIComponent(sessionPath) +
+                "&path=" + encodeURIComponent(filePath);
+            if (offset > 0) url += "&offset=" + offset;
+
+            var abortController = null;
+            var fetchOpts = { headers: { "X-Presync-Token": token } };
+            if (typeof AbortController !== "undefined") {
+                abortController = new AbortController();
+                fetchOpts.signal = abortController.signal;
+                // Per-file watchdog: a hung fetch must not stall the loop forever
+                setTimeout(function () { abortController.abort(); }, 5 * 60 * 1000);
+            }
+
+            fetch(url, fetchOpts).then(function (res) {
+                if (!res.ok) throw new Error("fetch failed");
+                if (!res.body || typeof res.body.getReader !== "function") {
+                    throw new Error("streaming not supported");
+                }
+
+                var reader = res.body.getReader();
+                var failed = false;
+
+                function pump() {
+                    return reader.read().then(function (result) {
+                        if (failed) return;
+                        if (result.done) {
+                            reader.releaseLock();
+                            window.AndroidBridge.finishFile(bridgePath, function (fin) {
+                                if (!fin.success) {
+                                    fail();
+                                    return;
+                                }
+                                var hash = null;
+                                try {
+                                    hash = JSON.parse(fin.data).hash;
+                                } catch (e) {
+                                    fail();
+                                    return;
+                                }
+                                var confirmBody = JSON.stringify({
+                                    session: sessionPath,
+                                    path: filePath,
+                                    sha256: hash
+                                });
+                                fetch("/sync/confirm", {
+                                    method: "POST",
+                                    headers: {
+                                        "Content-Type": "application/json",
+                                        "X-Presync-Token": token
+                                    },
+                                    body: confirmBody
+                                }).then(function (res) {
+                                    return res.json();
+                                }).then(function (confirmResult) {
+                                    if (confirmResult.ok) {
+                                        window.AndroidBridge.renameFile(bridgePath, function (ren) {
+                                            onDone(ren.success);
+                                        });
+                                    } else {
+                                        fail();
+                                    }
+                                }).catch(function () {
+                                    fail();
+                                });
+                            });
+                            return;
+                        }
+
+                        var b64 = toBase64(result.value);
+                        return bridgeCallWithWatchdog("writeChunk", bridgePath, b64, function (wr) {
+                            if (!wr.success) {
+                                failed = true;
+                                fail();
+                                return;
+                            }
+                            pump();
+                        });
+                    }).catch(function () {
+                        if (!failed) {
+                            failed = true;
+                            fail();
+                        }
+                    });
+                }
+
+                pump();
+            }).catch(function () {
+                fail();
+            });
+        });
+    }
+
+    // Calls a bridge method with a timeout: if the callback never fires
+    // (WebView death, process kill), the sync must not stall forever.
+    function bridgeCallWithWatchdog(method, path, arg, onResult) {
+        var called = false;
+        var watchdog = setTimeout(function () {
+            if (called) return;
+            called = true;
+            onResult({ success: false, data: "bridge call timed out" });
+        }, 60 * 1000);
+
+        window.AndroidBridge[method](path, arg, function (result) {
+            if (called) return;
+            called = true;
+            clearTimeout(watchdog);
+            onResult(result);
+        });
+    }
+
+    function toBase64(bytes) {
+        var binary = "";
+        var CHUNK = 0x8000;
+        for (var i = 0; i < bytes.length; i += CHUNK) {
+            binary += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK));
+        }
+        return btoa(binary);
+    }
+
+    // Applies mirror-mode deletions, then completes the session.
+    function finishAndroidSync(profileName, sessionPath, delta, done, total, errors) {
+        var deletes = delta.to_delete || [];
+        if (deletes.length === 0 || !isAndroid()) {
+            completeAndroidSync(sessionPath, done, total, errors);
+            return;
+        }
+
+        var i = 0;
+        function next() {
+            if (i >= deletes.length) {
+                completeAndroidSync(sessionPath, done, total, errors);
+                return;
+            }
+            var del = deletes[i++];
+            window.AndroidBridge.deleteFile(profileName + "/" + del.path, function (result) {
+                next();
+            });
+        }
+        next();
+    }
+
+    function completeAndroidSync(sessionPath, done, total, errors) {
+        fetch("/sync/complete", {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                "X-Presync-Token": token
+            },
+            body: JSON.stringify({ session: sessionPath })
+        }).then(function (res) {
+            return res.json().then(function (data) {
+                if (!res.ok) throw new Error(data.error || "complete failed");
+                return data;
+            });
+        }).then(function () {
+            androidSyncActive = false;
+            setProgressPulse(false);
+            updateSyncProgress("", done, total, errors);
+        }).catch(function () {
+            androidSyncActive = false;
+            setProgressPulse(false);
         });
     }
 
@@ -439,32 +564,12 @@
             "</div>";
     }
 
-    // Deletes mirror-mode leftovers from the device. Only the Android bridge
-    // can delete on-device files; on other surfaces this is a no-op (the PC
-    // client and server-side syncs handle their own deletions).
-    function applyDeletions(profileName, delta, onDone) {
-        var deletes = delta.to_delete || [];
-        if (deletes.length === 0 || !isAndroid()) {
-            onDone();
+    function renderProgress(el) {
+        if (androidSyncActive) {
+            // The Android sync loop drives its own progress display.
+            el.innerHTML = '<h1>Sync Progress</h1><div class="loading">Syncing...</div>';
             return;
         }
-
-        var i = 0;
-        function next() {
-            if (i >= deletes.length) {
-                onDone();
-                return;
-            }
-            var del = deletes[i++];
-            window.AndroidBridge.deleteFile(profileName + "/" + del.path, function (result) {
-                next();
-            });
-        }
-        next();
-    }
-
-    function renderProgress(el) {
-        if (androidSyncActive) return;
         el.innerHTML = '<h1>Sync Progress</h1><div class="loading">Loading...</div>';
 
         var lastDone = -1;
@@ -483,8 +588,6 @@
                 }
 
                 if (!active) {
-                    showProgressTab(false);
-                    setProgressPulse(false);
                     if (currentSession) {
                         el.innerHTML =
                             '<h1>Sync Progress</h1>' +
@@ -499,6 +602,8 @@
                             '<p>Start a sync from the Home screen</p>' +
                             "</div></div>";
                     }
+                    showProgressTab(false);
+                    setProgressPulse(false);
                     stallCount = 0;
                     return;
                 }
@@ -511,9 +616,10 @@
                 lastDone = active.done;
                 lastErrors = active.errors;
 
-                var stalled = stallCount >= 10;
-                showProgressTab(!stalled);
-                setProgressPulse(!stalled);
+                // Progress only advances per file, so a large single file
+                // stalls the counters — never hide the tab for that. Show the
+                // warning only after 60s of no change.
+                var stalled = stallCount >= 60;
 
                 var pct = active.total > 0 ? Math.round((active.done / active.total) * 100) : 0;
 

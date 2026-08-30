@@ -118,13 +118,24 @@ func handleSyncStart() http.HandlerFunc {
 			}
 		}
 
-		// Resolve destination from profile's destinations map
+		// Resolve destination from profile's destinations map. Rules:
+		//   - deviceID "local" (CLI self-sync): the "local" entry.
+		//   - webDeviceID (server-initiated web sync): no override — the caller
+		//     already passes the right destination per iteration.
+		//   - real paired devices: their registered entry only. An unregistered
+		//     device keeps its own locally-chosen destination — the "local"
+		//     fallback must never redirect a remote device's files to a
+		//     server-machine path.
 		var destination string
-		if deviceName != "" && profile.Destinations != nil {
-			destination = profile.Destinations[deviceName]
-		}
-		if destination == "" {
+		switch {
+		case req.DeviceID == "local":
 			destination = profile.Destinations["local"]
+		case req.DeviceID == webDeviceID:
+			// no override
+		default:
+			if deviceName != "" && profile.Destinations != nil {
+				destination = profile.Destinations[deviceName]
+			}
 		}
 
 		existing, err := transfer.FindSessionForDevice(req.DeviceID, req.Profile)

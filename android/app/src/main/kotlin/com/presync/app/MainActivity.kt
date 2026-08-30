@@ -10,6 +10,8 @@ import android.webkit.WebChromeClient
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import android.widget.Button
+import android.widget.LinearLayout
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
 import java.net.HttpURLConnection
@@ -50,16 +52,81 @@ class MainActivity : AppCompatActivity() {
             val reachable = checkServerHealth(serverUrl!!)
             runOnUiThread {
                 if (!reachable) {
-                    clearServerData()
-                    startActivity(Intent(this@MainActivity, PairingActivity::class.java).apply {
-                        flags = Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_NEW_TASK
-                    })
-                    finish()
+                    showRetryScreen(serverUrl)
                     return@runOnUiThread
                 }
                 setupWebView(serverUrl)
             }
         }.start()
+    }
+
+    // A transient outage (server restarting, WiFi blip) must never wipe the
+    // pairing data or the SAF folder grant — only the user can do that.
+    private fun showRetryScreen(serverUrl: String) {
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(32), dp(32), dp(32), dp(32))
+            setBackgroundColor(Color.parseColor("#1A1918"))
+            gravity = Gravity.CENTER
+        }
+
+        container.addView(TextView(this).apply {
+            text = "Cannot reach the server"
+            setTextColor(Color.parseColor("#F2F0EE"))
+            textSize = 18f
+            gravity = Gravity.CENTER
+        })
+        container.addView(TextView(this).apply {
+            text = "Check that the server is running and you are on the same network."
+            setTextColor(Color.parseColor("#7A756F"))
+            textSize = 14f
+            gravity = Gravity.CENTER
+            setPadding(0, dp(8), 0, 0)
+        })
+
+        val retryBtn = Button(this).apply {
+            text = "Retry"
+            setTextColor(Color.parseColor("#1A1918"))
+            setBackgroundColor(Color.parseColor("#D97757"))
+            setPadding(dp(24), dp(10), dp(24), dp(10))
+            setOnClickListener {
+                showConnectingScreen()
+                Thread {
+                    val reachable = checkServerHealth(serverUrl)
+                    runOnUiThread {
+                        if (reachable) {
+                            setupWebView(serverUrl)
+                        } else {
+                            showRetryScreen(serverUrl)
+                        }
+                    }
+                }.start()
+            }
+        }
+        container.addView(retryBtn, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.WRAP_CONTENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT
+        ).apply { topMargin = dp(24) })
+
+        val forgetBtn = Button(this).apply {
+            text = "Forget this server"
+            setTextColor(Color.parseColor("#F2F0EE"))
+            setBackgroundColor(Color.parseColor("#2A2928"))
+            setPadding(dp(24), dp(10), dp(24), dp(10))
+            setOnClickListener {
+                clearServerData()
+            }
+        }
+        container.addView(forgetBtn, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.WRAP_CONTENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT
+        ).apply { topMargin = dp(8) })
+
+        setContentView(container)
+    }
+
+    private fun dp(value: Int): Int {
+        return (value * resources.displayMetrics.density).toInt()
     }
 
     private fun showConnectingScreen() {
@@ -118,11 +185,12 @@ class MainActivity : AppCompatActivity() {
                 error: android.webkit.WebResourceError
             ) {
                 if (request.isForMainFrame) {
-                    clearServerData()
-                    startActivity(Intent(this@MainActivity, PairingActivity::class.java).apply {
-                        flags = Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_NEW_TASK
-                    })
-                    finish()
+                    // Transient load error — do NOT wipe pairing data. Show the
+                    // retry screen instead.
+                    val url = getServerUrl()
+                    if (url != null) {
+                        showRetryScreen(url)
+                    }
                 }
             }
         }
