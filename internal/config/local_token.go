@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 const localTokenFileName = "local-token"
@@ -30,15 +31,55 @@ func validLocalToken(s string) bool {
 	return err == nil
 }
 
+// acquireLocalTokenLock serializes token creation across processes. The lock
+// is an exclusive-create file; a stale lock (crashed process) is broken after
+// the grace period. The critical section is a few file writes.
+func acquireLocalTokenLock(path string) (func(), error) {
+	lockPath := path + ".lock"
+	deadline := time.Now().Add(3 * time.Second)
+
+	for {
+		f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+		if err == nil {
+			f.Close()
+			return func() { os.Remove(lockPath) }, nil
+		}
+		if !os.IsExist(err) {
+			return nil, fmt.Errorf("creating local token lock: %w", err)
+		}
+
+		if info, statErr := os.Stat(lockPath); statErr == nil && time.Since(info.ModTime()) > 10*time.Second {
+			os.Remove(lockPath)
+			continue
+		}
+		if time.Now().After(deadline) {
+			return nil, fmt.Errorf("timed out waiting for local token lock")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 // GetLocalToken returns the local CLI token, creating it atomically on first
-// use. The O_CREATE|O_EXCL create guarantees that concurrent callers (daemon
-// and CLI are separate processes) never overwrite each other: the loser of the
-// race re-reads the winner's token. A corrupt/truncated file is healed by
-// regeneration.
+// use. Creation is serialized with a lock file and published with an atomic
+// rename, so concurrent callers (daemon and CLI are separate processes) always
+// end up with the same complete token. A corrupt/truncated file is healed.
 func GetLocalToken() (string, error) {
 	path := LocalTokenPath()
 
 	// Fast path: existing valid token
+	if data, err := os.ReadFile(path); err == nil {
+		if token := strings.TrimSpace(string(data)); validLocalToken(token) {
+			return token, nil
+		}
+	}
+
+	release, err := acquireLocalTokenLock(path)
+	if err != nil {
+		return "", err
+	}
+	defer release()
+
+	// Another process may have created the token while we waited for the lock.
 	if data, err := os.ReadFile(path); err == nil {
 		if token := strings.TrimSpace(string(data)); validLocalToken(token) {
 			return token, nil
@@ -50,38 +91,29 @@ func GetLocalToken() (string, error) {
 		return "", fmt.Errorf("generating local token: %w", err)
 	}
 
-	for attempt := 0; attempt < 2; attempt++ {
-		f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0o600)
-		if err != nil {
-			if os.IsExist(err) {
-				// Lost the creation race — use the winner's token, unless it is
-				// corrupt (truncated/empty), in which case heal and retry.
-				data, rerr := os.ReadFile(path)
-				if rerr == nil {
-					if winner := strings.TrimSpace(string(data)); validLocalToken(winner) {
-						return winner, nil
-					}
-				}
-				if rerr := os.Remove(path); rerr != nil {
-					return "", fmt.Errorf("removing corrupt local token: %w", rerr)
-				}
-				continue
-			}
-			return "", fmt.Errorf("creating local token: %w", err)
-		}
+	tmp, err := os.CreateTemp(filepath.Dir(path), localTokenFileName+".tmp-*")
+	if err != nil {
+		return "", fmt.Errorf("creating local token temp file: %w", err)
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
 
-		if _, werr := f.Write([]byte(token)); werr != nil {
-			f.Close()
-			os.Remove(path)
-			return "", fmt.Errorf("writing local token: %w", werr)
-		}
-		if cerr := f.Close(); cerr != nil {
-			os.Remove(path)
-			return "", fmt.Errorf("closing local token: %w", cerr)
-		}
-
-		return token, nil
+	if _, err := tmp.WriteString(token); err != nil {
+		tmp.Close()
+		return "", fmt.Errorf("writing local token temp file: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return "", fmt.Errorf("closing local token temp file: %w", err)
+	}
+	if err := os.Chmod(tmpName, 0o600); err != nil {
+		return "", fmt.Errorf("setting local token permissions: %w", err)
 	}
 
-	return "", fmt.Errorf("unable to create local token after retries")
+	// Atomic publication: readers see either no file, the old corrupt file,
+	// or the complete new token — never a partially written one.
+	if err := os.Rename(tmpName, path); err != nil {
+		return "", fmt.Errorf("publishing local token: %w", err)
+	}
+
+	return token, nil
 }
