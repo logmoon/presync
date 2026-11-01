@@ -2,7 +2,7 @@
 
 ## Active Feature
 
-Manual end-to-end verification of the Android pull/push client after the pairing-bridge, resumable-baseline, and progress/Resume UI fixes.
+Task 12 — Auto-sync on same network (next up). The manual device E2E and the Progress multi-session list UI are closed and accepted.
 
 Branch: main
 
@@ -12,19 +12,18 @@ closing
 
 ## Next Action
 
-Resume the `music` pull on the phone (it is running/paused around 151+/1235; session `8bc052af7b3ebe88-music-20261101T181657...`). Then finish the manual tests: push (pick a phone source folder via SAF, send, repeat-send, stop/resume, mirror delete), `small` pull (baseline, drop/resume with a big file, mirror delete), additive check with `~/Music/zz-presync-additive.txt`, and a second Sync Now per profile asserting zero transfers.
+Start Task 12 with the Architect Gate: auto-sync on same network — client periodically attempts its stored server address, triggers a sync on success respecting a cooldown (no more than once per N minutes); Android background service, PC lightweight watcher; Settings toggle for global + per-profile override matching `config.toml`'s `auto_sync` (`*bool`). Meanwhile the `music` pull is still finishing on the phone in the background; let it complete, then do the deferred additive check and final zero-delta as follow-ups.
 
 ## Decisions & Problems Not Yet Elsewhere
 
-- The old music session went stale (>30 min) and was discarded; the current session started fresh, so ~83 files already on the phone re-transfer once. Expected.
-- Phone destination is `Sync/Music`; pull paths are `Sync/Music/<profile>/...`. Push destination on the PC is `~/presync-test/push-recv`.
-- Home now shows `Syncing…`/`Sending…` disabled while a local sync runs, `Resume sync`/`Resume upload` for paused sessions, and disables all sync/push actions during a run.
-- Pairing bridge fix: never read `webView.url` off the UI thread; SafBridge uses a `@Volatile currentUrl` kept in sync by MainActivity.
-- Review findings fixed: legacy sessions hash-verify before seeding metadata; empty push sources reconcile the baseline; completed/stale sessions are reaped with a grace window; server-driven cards say “in progress”.
-- Verified on-device: pairing, music pull progress, keep-screen-awake, Stop → paused card with Resume, Home disabled/Syncing state, Resumed twice successfully.
+- E2E fixtures: `~/presync-test/small/big.bin` (30MB, small source no longer has a.txt); phone push source `/sdcard/Download/presync-push-src` (a.txt, c.txt, sub/c.txt, big.bin); `~/presync-test/push-recv` holds all of those except b.txt (mirror-test delete).
+- Push/small E2E passed end to end: 5-file push incl. 30MB big.bin, changed-file-only re-upload, Stop at 23,592,960/31,457,280 → Resume at that offset, zero-delta, mirror delete only on complete. Small pull: baseline, Stop at 11,967,711/31,457,280 → resume at offset, mirror delete a.txt, zero-delta. Isolated scripts all pass (transfer 48, connect 13, push 29, pairing 19).
+- The music session (`8bc052af7b3ebe88-music-20261101T181657...`) has a 30-minute inactivity limit: if it goes stale before completion it is discarded and, with no baseline written yet, the next sync re-transfers the whole 7.26GB.
+- The phone still runs the pre-fix `app.js` until the page is reloaded; the new Progress list (all sessions, per-card Stop/Resume) needs an on-device reload check.
+- Throughput is per-file-overhead-bound, not WiFi-bound: a single 30MB file resumed at ~10MB/s, while ~5.4MB MP3s average ~3s each (SAF write/rename + native hash + confirm per file).
 
 ## Open Questions
 
-- Does the full 6.8G music pull complete cleanly with the new baseline?
-- Push SAF folder picking, stop/resume of a large upload, and mirror delete are still untested on-device.
-- The keep-screen-on flag after a WebView reload mid-sync (native lifecycle does not clear it) is unverified; PairingActivity’s one-shot guard is fine as long as proceedWithUrl always navigates.
+- Does the full 6.8G music pull complete cleanly, and does the additive check behave (file added lands; deleted from source stays on phone)?
+- Does the final music zero-delta sync report no transfers once the baseline exists?
+- On-device rendering of the new Progress list (live + paused cards visible together) after reload.

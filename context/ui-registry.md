@@ -221,3 +221,23 @@ Last updated: 2026-06-21
 
 **Pattern notes:**
 Used for multi-select destination filtering on profile cards. Click to toggle selection. When a profile has only one destination, the chip gets the `.locked` class and cannot be deselected. Selected chips use the accent color (same as primary buttons) to indicate active state. Chips sit below the card subtitle and above the mode badge / sync button row.
+
+### Progress Card List
+
+File: `web/app.js` (renderer), `web/style.css` (card)
+Last updated: 2026-11-01
+
+| Property         | Value                          |
+| ---------------- | ------------------------------ |
+| Container        | `#content.content` — flex column, `gap: var(--space-3)` (16px) |
+| Card             | Reuses the Card pattern verbatim (`bg-card`, `border-default`, `12px`) |
+| Title            | 16px / 600 / `var(--text-primary)` — profile name, or "Sync complete" |
+| Subtitle         | 14px / 400 / `var(--text-secondary)` — "X of Y files", plus inline `status-error` error count and `status-warning` "paused" marker |
+| Progress bar     | Existing Progress Bar pattern; fill width = done/total |
+| Current file row | File List Item pattern, state label `sending` / `paused` / `in progress` |
+| Action — live    | Button — Secondary, label `Stop` |
+| Action — paused  | Button — Primary, label `Resume sync` / `Resume upload` |
+| Action row       | `margin-top: var(--space-3)` (16px) |
+
+**Pattern notes:**
+Progress renders every session as its own card — active local transfer first, then the locally paused session, then any other non-complete session the server still tracks (newest first). Cards are deduped by profile+direction so the live/paused card never appears twice. Only the live card carries Stop; resumable cards carry Resume, and those buttons render disabled while another local sync runs (one sync at a time). No new colors, spacing, or component shapes — every card is the standard Card pattern.

@@ -16,6 +16,8 @@
     var androidSyncCurrent = "";
     var androidSyncDirection = "pull";
     var pausedSession = null;
+    var progressSessions = [];
+    var progressCompleted = null;
     var bridgeCallbackSeq = 0;
 
     // Android's JavascriptInterface can only receive strings, not functions.
@@ -177,76 +179,123 @@
     }
 
     function renderPausedProgress() {
-        if (!pausedSession) return;
-        renderSyncCard({
-            profile: pausedSession.profile,
-            done: pausedSession.done,
-            total: pausedSession.total,
-            errors: pausedSession.errors,
-            current: pausedSession.current,
-            direction: pausedSession.direction,
-            running: false,
-            canResume: true,
-            tone: "paused",
-            onResume: function (btn) {
-                var p = pausedSession;
-                if (!p) return;
-                if (p.direction === "push") {
-                    pushToDevice(p.profile, btn);
-                } else {
-                    triggerSync(p.profile, btn);
-                }
-            }
-        });
+        renderProgressView();
     }
 
-    // One progress card for every case: live transfer, paused, server-side
-    // progress, and completed. Keeping a single renderer is what prevents the
-    // UI from drifting between the loop, the server poll, and tab switches.
-    function renderSyncCard(opts) {
-        var el = document.getElementById("content");
-        if (!el || activeScreen !== "progress") return;
+    function sessionKey(profile, direction) {
+        return (direction || "pull") + "|" + profile;
+    }
 
-        var total = opts.total || 0;
-        var done = opts.done || 0;
-        var errors = opts.errors || 0;
+    // Progress lists every session at once: the local transfer in flight, the
+    // locally paused session, and any other session the server still tracks
+    // (a profile stopped earlier, or another paired device viewed from the PC).
+    // Deduping by profile+direction keeps the live card from appearing twice.
+    function buildProgressCards() {
+        var cards = [];
+        var seen = {};
+
+        // The server still lists the just-completed session until it is
+        // reaped; don't show a stale "paused" card under "Sync complete".
+        if (progressCompleted) {
+            seen[sessionKey(progressCompleted.profile, progressCompleted.direction)] = true;
+        }
+
+        if (androidSyncActive) {
+            seen[sessionKey(androidSyncProfile, androidSyncDirection)] = true;
+            cards.push({
+                profile: androidSyncProfile,
+                direction: androidSyncDirection,
+                done: androidSyncDone,
+                total: androidSyncTotal,
+                errors: androidSyncErrors,
+                current: androidSyncCurrent,
+                running: true,
+                canStop: androidSyncCanStop,
+                tone: ""
+            });
+        }
+
+        if (pausedSession) {
+            var pk = sessionKey(pausedSession.profile, pausedSession.direction);
+            if (!seen[pk]) {
+                seen[pk] = true;
+                cards.push({
+                    profile: pausedSession.profile,
+                    direction: pausedSession.direction,
+                    done: pausedSession.done,
+                    total: pausedSession.total,
+                    errors: pausedSession.errors,
+                    current: pausedSession.current,
+                    running: false,
+                    canResume: true,
+                    tone: "paused"
+                });
+            }
+        }
+
+        for (var i = 0; i < progressSessions.length; i++) {
+            var s = progressSessions[i];
+            if (s.complete) continue;
+            var k = sessionKey(s.profile, s.direction);
+            if (seen[k]) continue;
+            seen[k] = true;
+            cards.push({
+                profile: s.profile,
+                direction: s.direction,
+                done: s.done,
+                total: s.total,
+                errors: s.errors,
+                current: s.current,
+                running: false,
+                canResume: isAndroid(),
+                tone: isAndroid() ? "paused" : "external"
+            });
+        }
+
+        return cards;
+    }
+
+    function progressCardHTML(card, index) {
+        var total = card.total || 0;
+        var done = card.done || 0;
+        var errors = card.errors || 0;
         var pct = total > 0 ? Math.round((done / total) * 100) : 0;
 
         var subtitle = done + " of " + total + " files";
         if (errors > 0) {
             subtitle += ' &middot; <span style="color:var(--status-error)">' + errors + " errors</span>";
         }
-        if (opts.tone === "paused") {
+        if (card.tone === "paused") {
             subtitle += ' &middot; <span style="color:var(--status-warning)">paused</span>';
         }
 
         var current = "";
-        if (opts.current) {
-            var stateLabel = opts.running ? "sending" : (opts.tone === "paused" ? "paused" : "in progress");
+        if (card.current) {
+            var stateLabel = card.running ? "sending" : (card.tone === "paused" ? "paused" : "in progress");
             current =
                 '<div class="file-list"><div class="file-item">' +
-                '<span class="name">' + esc(opts.current) + "</span>" +
+                '<span class="name">' + esc(card.current) + "</span>" +
                 '<span class="state in_progress">' + stateLabel + "</span>" +
                 "</div></div>";
         }
 
         var actions = "";
-        if (opts.running && opts.canStop) {
+        if (card.running && card.canStop) {
             actions =
                 '<div style="margin-top:var(--space-3)">' +
-                '<button class="btn btn-secondary" id="sync-stop-btn">Stop</button>' +
+                '<button class="btn btn-secondary" data-card-stop="' + index + '">Stop</button>' +
                 "</div>";
-        } else if (opts.canResume) {
-            var label = opts.direction === "push" ? "Resume upload" : "Resume sync";
+        } else if (card.canResume) {
+            var label = card.direction === "push" ? "Resume upload" : "Resume sync";
+            var disabled = androidSyncActive ? " disabled" : "";
             actions =
                 '<div style="margin-top:var(--space-3)">' +
-                '<button class="btn btn-primary" id="sync-resume-btn">' + label + "</button>" +
+                '<button class="btn btn-primary" data-card-resume="' + index + '"' + disabled + ">" + label + "</button>" +
                 "</div>";
         }
 
-        var title = opts.complete ? "Sync complete" : esc(opts.profile || "");
-        el.innerHTML =
-            '<h1>Sync Progress</h1>' +
+        var title = card.complete ? "Sync complete" : esc(card.profile || "");
+        return (
             '<div class="card">' +
             '<div class="card-title">' + title + "</div>" +
             '<div class="card-subtitle">' + subtitle + "</div>" +
@@ -255,25 +304,98 @@
             "</div>" +
             current +
             actions +
-            "</div>";
+            "</div>"
+        );
+    }
 
-        var stopBtn = document.getElementById("sync-stop-btn");
-        if (stopBtn) {
-            stopBtn.addEventListener("click", function () {
+    function renderProgressView() {
+        var el = document.getElementById("content");
+        if (!el || activeScreen !== "progress") return;
+
+        var cards = buildProgressCards();
+        if (progressCompleted) {
+            cards.unshift({
+                profile: progressCompleted.profile,
+                direction: progressCompleted.direction,
+                done: progressCompleted.done,
+                total: progressCompleted.total,
+                errors: progressCompleted.errors,
+                complete: true
+            });
+        }
+
+        var html = "<h1>Sync Progress</h1>";
+        if (cards.length === 0) {
+            html +=
+                '<div class="card"><div class="empty-state">' +
+                "<p>No active sync</p>" +
+                '<p>Start a sync from the Home screen</p>' +
+                "</div></div>";
+        } else {
+            for (var i = 0; i < cards.length; i++) {
+                html += progressCardHTML(cards[i], i);
+            }
+        }
+        el.innerHTML = html;
+
+        var stopButtons = el.querySelectorAll("button[data-card-stop]");
+        for (var s = 0; s < stopButtons.length; s++) {
+            stopButtons[s].addEventListener("click", function () {
                 this.disabled = true;
                 this.textContent = "Stopping\u2026";
                 requestAndroidSyncStop();
             });
         }
 
-        var resumeBtn = document.getElementById("sync-resume-btn");
-        if (resumeBtn && opts.onResume) {
-            resumeBtn.addEventListener("click", function () {
+        var resumeButtons = el.querySelectorAll("button[data-card-resume]");
+        for (var r = 0; r < resumeButtons.length; r++) {
+            resumeButtons[r].addEventListener("click", function () {
+                var card = cards[parseInt(this.getAttribute("data-card-resume"), 10)];
+                if (!card) return;
                 this.disabled = true;
                 this.textContent = "Starting\u2026";
-                opts.onResume(this);
+                if (card.direction === "push") {
+                    pushToDevice(card.profile, this);
+                } else {
+                    triggerSync(card.profile, this);
+                }
             });
         }
+    }
+
+    // Fetches every session the server still tracks and re-renders the list.
+    // Runs while the Progress tab is open, including during a local transfer,
+    // so a paused session never disappears behind the active one.
+    function refreshProgressSessions() {
+        api("GET", "/web/sessions").then(function (data) {
+            progressSessions = data.sessions || [];
+            var has = androidSyncActive || !!pausedSession;
+            for (var i = 0; i < progressSessions.length; i++) {
+                if (!progressSessions[i].complete) {
+                    has = true;
+                    break;
+                }
+            }
+            if (!has) {
+                setProgressPulse(false);
+            }
+            showProgressTab(has);
+            renderProgressView();
+        }).catch(function () {
+            if (activeScreen !== "progress") return;
+            if (androidSyncActive || pausedSession || progressCompleted || progressSessions.length > 0) {
+                renderProgressView();
+                return;
+            }
+            var el = document.getElementById("content");
+            if (el) {
+                el.innerHTML =
+                    "<h1>Sync Progress</h1>" +
+                    '<div class="card"><div class="empty-state">' +
+                    "<p>Failed to load sync status</p>" +
+                    "</div></div>";
+            }
+        });
     }
 
     function refreshProgressTab() {
@@ -528,10 +650,7 @@
             alert("A sync is already running.");
             return;
         }
-        if (pollInterval) {
-            clearInterval(pollInterval);
-            pollInterval = null;
-        }
+        progressCompleted = null;
         btn.disabled = true;
         btn.textContent = "Starting...";
 
@@ -661,10 +780,6 @@
                 return;
             }
 
-            if (pollInterval) {
-                clearInterval(pollInterval);
-                pollInterval = null;
-            }
             showProgressTab(true);
             setProgressPulse(true);
             androidSyncStopRequested = false;
@@ -1043,14 +1158,15 @@
             setProgressPulse(false);
             androidSyncCanStop = false;
             pausedSession = null;
-            showProgressTab(false);
-            renderSyncCard({
+            progressCompleted = {
                 profile: androidSyncProfile,
+                direction: androidSyncDirection,
                 done: done,
                 total: total,
-                errors: errors,
-                complete: true
-            });
+                errors: errors
+            };
+            renderProgressView();
+            refreshProgressTab();
             if (activeScreen === "home") applyHomeActions();
             if (onDone) onDone(true);
         }).catch(function () {
@@ -1071,10 +1187,7 @@
             alert("A sync is already running.");
             return;
         }
-        if (pollInterval) {
-            clearInterval(pollInterval);
-            pollInterval = null;
-        }
+        progressCompleted = null;
         androidSyncProfile = profileName;
         androidSyncDirection = "push";
         androidSyncDone = 0;
@@ -1169,10 +1282,6 @@
                 return;
             }
 
-            if (pollInterval) {
-                clearInterval(pollInterval);
-                pollInterval = null;
-            }
             showProgressTab(true);
             setProgressPulse(true);
             androidSyncStopRequested = false;
@@ -1467,14 +1576,15 @@
             setProgressPulse(false);
             androidSyncCanStop = false;
             pausedSession = null;
-            showProgressTab(false);
-            renderSyncCard({
+            progressCompleted = {
                 profile: profileName,
+                direction: androidSyncDirection,
                 done: done,
                 total: total,
-                errors: errors,
-                complete: true
-            });
+                errors: errors
+            };
+            renderProgressView();
+            refreshProgressTab();
             if (activeScreen === "home") applyHomeActions();
         }).catch(function () {
             // The server kept the session: Resume can finish the upload.
@@ -1502,85 +1612,19 @@
         androidSyncErrors = errors;
         androidSyncCurrent = current || "";
 
-        renderSyncCard({
-            profile: androidSyncProfile,
-            done: done,
-            total: total,
-            errors: errors,
-            current: androidSyncCurrent,
-            running: androidSyncActive,
-            canStop: androidSyncActive && androidSyncCanStop,
-            direction: androidSyncDirection
-        });
+        renderProgressView();
     }
 
     function renderProgress(el) {
-        if (androidSyncActive) {
-            updateSyncProgress(androidSyncProfile, androidSyncDone, androidSyncTotal, androidSyncErrors, androidSyncCurrent);
-            return;
-        }
-        if (pausedSession) {
-            renderPausedProgress();
-            return;
-        }
-
+        progressSessions = [];
+        progressCompleted = null;
         el.innerHTML = '<h1>Sync Progress</h1><div class="loading">Loading...</div>';
-
-        function refresh() {
-            api("GET", "/web/sessions").then(function (data) {
-                var sessions = data.sessions || [];
-                var active = null;
-                for (var i = 0; i < sessions.length; i++) {
-                    if (!sessions[i].complete) {
-                        active = sessions[i];
-                        break;
-                    }
-                }
-
-                if (!active) {
-                    el.innerHTML =
-                        '<h1>Sync Progress</h1>' +
-                        '<div class="card"><div class="empty-state">' +
-                        "<p>No active sync</p>" +
-                        '<p>Start a sync from the Home screen</p>' +
-                        "</div></div>";
-                    showProgressTab(false);
-                    setProgressPulse(false);
-                    return;
-                }
-
-                showProgressTab(true);
-                var canResume = isAndroid();
-                renderSyncCard({
-                    profile: active.profile,
-                    done: active.done,
-                    total: active.total,
-                    errors: active.errors,
-                    current: active.current,
-                    running: false,
-                    canStop: false,
-                    canResume: canResume,
-                    direction: active.direction,
-                    tone: canResume ? "paused" : "external",
-                    onResume: canResume ? function (btn) {
-                        if (active.direction === "push") {
-                            pushToDevice(active.profile, btn);
-                        } else {
-                            triggerSync(active.profile, btn);
-                        }
-                    } : null
-                });
-            }).catch(function () {
-                el.innerHTML =
-                    '<h1>Sync Progress</h1>' +
-                    '<div class="card"><div class="empty-state">' +
-                    "<p>Failed to load sync status</p>" +
-                    "</div></div>";
-            });
+        if (androidSyncActive || pausedSession) {
+            renderProgressView();
         }
 
-        refresh();
-        pollInterval = setInterval(refresh, 2000);
+        refreshProgressSessions();
+        pollInterval = setInterval(refreshProgressSessions, 2000);
     }
 
     function renderProfiles(el) {

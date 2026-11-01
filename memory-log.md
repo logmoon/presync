@@ -6,6 +6,10 @@ enough. Capped at the last 20 entries; oldest entries drop off as new ones are a
 
 ---
 
+### 2026-11-01 — manual E2E + Progress session list
+
+Push and small pull verified end to end on the phone (baseline, changed-file-only upload, stop/resume at exact offsets, mirror delete only after complete, zero-delta repeats); all isolated E2E scripts pass. Fixed the Progress screen to list every session (live, paused, server-side) with per-card Stop/Resume; review found one pulse-dot leak, fixed. Music pull accepted with completion/additive checks deferred.
+
 ### 2026-11-01 — Pairing bridge, baseline resume, progress UI
 
 Fixed the Android pairing hang (WebView method called on the JavaBridge thread). Added a per-device last-synced baseline so resume/repeat syncs no longer re-transfer everything, fixed resume reconciliation against source metadata, and unified the progress UI: Stop leaves a paused card with Resume, Home shows Syncing/Sending disabled, counts resume from session states, and the current file is shown. All Go tests and the four E2E scripts pass; all four review findings were fixed. Device testing is mid-flight — the music pull is running/resumable; push and the small-profile resume/mirror tests remain.

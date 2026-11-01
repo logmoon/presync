@@ -3,18 +3,17 @@
 ## Current Status
 
 **Phase:** Phase 2 — Polish
-**Last completed:** Pairing bridge fix, last-synced baseline/resume, progress + Stop/Resume UI, review fixes — all tests pass
-**Next:** Finish the manual E2E (music pull, push, small resume/mirror, additive), then Task 12 auto-sync
+**Last completed:** Manual E2E device test (push + small pull + music pull) — accepted; Progress multi-session list UI + review fix
+**Next:** 12 Auto-sync on same network
 
 ---
 
 ## In Progress
 
-- Manual end-to-end test — music pull running/resumable (~151+/1235); push and small-profile resume/mirror tests pending.
+None. The music pull is still finishing on the phone in the background; its additive check and final zero-delta sync are follow-ups after Task 12 if not done beforehand.
 
 ## Up Next
 
-- Finish manual E2E: music completion + zero-delta second sync, push, small resume/mirror, additive
 - 12 Auto-sync on same network
 - 13 mDNS discovery
 - 14 Sync history / logs in UI
@@ -45,7 +44,7 @@ None.
 - [x] 10 Multiple profiles
 - [x] 11 Per-profile sync modes (mirror / additive)
 - [x] 11A Push profiles (client → server)
-- [ ] Manual end-to-end device test (pull + push)
+- [x] Manual end-to-end device test (pull + push)
 - [ ] 12 Auto-sync on same network
 - [ ] 13 mDNS discovery
 - [ ] 14 Sync history / logs in UI
@@ -120,6 +119,8 @@ _Add decisions here as they are made during implementation._
 - **Push path safety**: containment is checked lexically and against resolved symlinks; symlinked temp files are rejected.
 - **Last-synced baseline** (Phase 5 fix): recipient mtimes are never preserved (Android SAF writes a new one), so the old delta classified every synced file as changed and resume/repeat syncs re-transferred everything. The server now keeps `state/<device-id>-<profile>.json` with the source metadata of what the device actually got, computes deltas against it (`diff.ComputeDeltaWithBase`), and reconciles resume state against source metadata instead of destination mtimes. Pull and push both use it; web-initiated syncs key the baseline by a per-destination device ID.
 - **Progress state** (Phase 5 fix): one Progress card renderer drives live, paused, server-driven, and completed states; counts initialize from session states (no restart at zero), the current filename is shown, Stop leaves a paused card with Resume, and `/web/sessions` is device-filtered with push sessions included.
+- **Manual E2E results** (Phase 5): push verified end to end (5 files including a 30MB `big.bin`, changed-file-only re-upload, Stop at 75% → Resume continued at the server offset, zero-delta repeat, mirror delete applied only after complete). Small pull verified the same way (baseline, Stop at 38% → resume at offset, mirror delete, zero-delta). All four isolated E2E scripts pass (transfer 48, connect 13, push 29, pairing 19).
+- **Progress shows every session** (Phase 5 fix): `renderProgressView` lists the live local card, the locally paused session, and every non-complete `/web/sessions` entry, deduped by profile+direction. The poll now runs during a local transfer too, per-card Stop/Resume replace the single-card ids, Resume is disabled while a sync runs, and the nav pulse clears when nothing is active. Verified headlessly with two sessions rendered newest-first.
 
 ---
 
