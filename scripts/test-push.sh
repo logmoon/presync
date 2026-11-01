@@ -216,6 +216,14 @@ COMPLETE=$(push_complete "$SESSION")
 assert_eq "session completed" "True" "$(echo "$COMPLETE" | json_get "d['ok']")"
 
 echo ""
+echo "=== Test 1b: unchanged second push uploads nothing ==="
+AGAIN=$(start_push "PhoneMusic" "$SRC_ADD")
+AGAIN_SESSION=$(echo "$AGAIN" | json_get "d['session']")
+AGAIN_COUNT=$(echo "$AGAIN" | json_get "len(d['files'])")
+assert_eq "unchanged second push has no files" "0" "$AGAIN_COUNT"
+push_complete "$AGAIN_SESSION" > /dev/null
+
+echo ""
 echo "=== Test 2: resume from server-held offset ==="
 dd if=/dev/urandom of="$SRC_ADD/resume.bin" bs=1024 count=300 2>/dev/null
 START=$(start_push "PhoneMusic" "$SRC_ADD")

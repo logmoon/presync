@@ -2,11 +2,20 @@
     "use strict";
 
     var token = null;
-    var currentSession = null;
     var pollInterval = null;
     var activeScreen = "home";
     var destSelections = {};
     var androidSyncActive = false;
+    var androidSyncStopRequested = false;
+    var androidSyncCanStop = false;
+    var androidSyncAbort = null;
+    var androidSyncProfile = "";
+    var androidSyncDone = 0;
+    var androidSyncTotal = 0;
+    var androidSyncErrors = 0;
+    var androidSyncCurrent = "";
+    var androidSyncDirection = "pull";
+    var pausedSession = null;
     var bridgeCallbackSeq = 0;
 
     // Android's JavascriptInterface can only receive strings, not functions.
@@ -122,6 +131,242 @@
         }
     }
 
+    // Toggles the Android-side keep-screen-on flag along with the JS state.
+    // Older APKs without the bridge method still sync, they just may sleep.
+    function setAndroidSyncActive(active) {
+        androidSyncActive = active;
+        if (isAndroid() && typeof window.AndroidBridge.setSyncActive === "function") {
+            try {
+                window.AndroidBridge.setSyncActive(active);
+            } catch (e) {
+                // Ignore — screen wake is a convenience, not a sync requirement.
+            }
+        }
+    }
+
+    function requestAndroidSyncStop() {
+        androidSyncStopRequested = true;
+        if (androidSyncAbort) {
+            try {
+                androidSyncAbort.abort();
+            } catch (e) {
+                // The loop also checks the flag between chunks.
+            }
+            androidSyncAbort = null;
+        }
+    }
+
+    // Leaves the session and temp files in place, so Resume continues it.
+    // The stop flag stays set until the next sync starts, so a late callback
+    // from the interrupted transfer cannot restart the loop.
+    function pauseAndroidSync() {
+        androidSyncCanStop = false;
+        setAndroidSyncActive(false);
+        setProgressPulse(false);
+        pausedSession = {
+            profile: androidSyncProfile,
+            direction: androidSyncDirection,
+            done: androidSyncDone,
+            total: androidSyncTotal,
+            errors: androidSyncErrors,
+            current: androidSyncCurrent
+        };
+        showProgressTab(true);
+        renderPausedProgress();
+        if (activeScreen === "home") applyHomeActions();
+    }
+
+    function renderPausedProgress() {
+        if (!pausedSession) return;
+        renderSyncCard({
+            profile: pausedSession.profile,
+            done: pausedSession.done,
+            total: pausedSession.total,
+            errors: pausedSession.errors,
+            current: pausedSession.current,
+            direction: pausedSession.direction,
+            running: false,
+            canResume: true,
+            tone: "paused",
+            onResume: function (btn) {
+                var p = pausedSession;
+                if (!p) return;
+                if (p.direction === "push") {
+                    pushToDevice(p.profile, btn);
+                } else {
+                    triggerSync(p.profile, btn);
+                }
+            }
+        });
+    }
+
+    // One progress card for every case: live transfer, paused, server-side
+    // progress, and completed. Keeping a single renderer is what prevents the
+    // UI from drifting between the loop, the server poll, and tab switches.
+    function renderSyncCard(opts) {
+        var el = document.getElementById("content");
+        if (!el || activeScreen !== "progress") return;
+
+        var total = opts.total || 0;
+        var done = opts.done || 0;
+        var errors = opts.errors || 0;
+        var pct = total > 0 ? Math.round((done / total) * 100) : 0;
+
+        var subtitle = done + " of " + total + " files";
+        if (errors > 0) {
+            subtitle += ' &middot; <span style="color:var(--status-error)">' + errors + " errors</span>";
+        }
+        if (opts.tone === "paused") {
+            subtitle += ' &middot; <span style="color:var(--status-warning)">paused</span>';
+        }
+
+        var current = "";
+        if (opts.current) {
+            var stateLabel = opts.running ? "sending" : (opts.tone === "paused" ? "paused" : "in progress");
+            current =
+                '<div class="file-list"><div class="file-item">' +
+                '<span class="name">' + esc(opts.current) + "</span>" +
+                '<span class="state in_progress">' + stateLabel + "</span>" +
+                "</div></div>";
+        }
+
+        var actions = "";
+        if (opts.running && opts.canStop) {
+            actions =
+                '<div style="margin-top:var(--space-3)">' +
+                '<button class="btn btn-secondary" id="sync-stop-btn">Stop</button>' +
+                "</div>";
+        } else if (opts.canResume) {
+            var label = opts.direction === "push" ? "Resume upload" : "Resume sync";
+            actions =
+                '<div style="margin-top:var(--space-3)">' +
+                '<button class="btn btn-primary" id="sync-resume-btn">' + label + "</button>" +
+                "</div>";
+        }
+
+        var title = opts.complete ? "Sync complete" : esc(opts.profile || "");
+        el.innerHTML =
+            '<h1>Sync Progress</h1>' +
+            '<div class="card">' +
+            '<div class="card-title">' + title + "</div>" +
+            '<div class="card-subtitle">' + subtitle + "</div>" +
+            '<div class="progress-bar" style="margin-top:var(--space-2)">' +
+            '<div class="progress-fill" style="width:' + pct + '%"></div>' +
+            "</div>" +
+            current +
+            actions +
+            "</div>";
+
+        var stopBtn = document.getElementById("sync-stop-btn");
+        if (stopBtn) {
+            stopBtn.addEventListener("click", function () {
+                this.disabled = true;
+                this.textContent = "Stopping\u2026";
+                requestAndroidSyncStop();
+            });
+        }
+
+        var resumeBtn = document.getElementById("sync-resume-btn");
+        if (resumeBtn && opts.onResume) {
+            resumeBtn.addEventListener("click", function () {
+                this.disabled = true;
+                this.textContent = "Starting\u2026";
+                opts.onResume(this);
+            });
+        }
+    }
+
+    function refreshProgressTab() {
+        if (!token || androidSyncActive) return;
+        api("GET", "/web/sessions").then(function (data) {
+            var sessions = data.sessions || [];
+            var has = false;
+            for (var i = 0; i < sessions.length; i++) {
+                if (!sessions[i].complete) has = true;
+            }
+            showProgressTab(has);
+        }).catch(function () {
+            // Leave the tab as-is if the status call fails.
+        });
+    }
+
+    // Keeps the Home cards honest: the active profile is "Syncing…" and not
+    // pressable, resumable sessions say "Resume", and everything else is idle.
+    function applyHomeActions() {
+        if (activeScreen !== "home") return;
+        var el = document.getElementById("content");
+        if (!el) return;
+
+        if (isAndroid() && androidSyncActive) {
+            var busy = el.querySelectorAll("button[data-profile], button[data-push]");
+            for (var i = 0; i < busy.length; i++) {
+                busy[i].disabled = true;
+                var name = busy[i].getAttribute("data-profile") || busy[i].getAttribute("data-push");
+                if (name === androidSyncProfile) {
+                    busy[i].textContent = androidSyncDirection === "push" ? "Sending\u2026" : "Syncing\u2026";
+                }
+            }
+        }
+
+        api("GET", "/web/sessions").then(function (data) {
+            if (activeScreen !== "home") return;
+            var sessions = data.sessions || [];
+            var byProfile = {};
+            for (var i = 0; i < sessions.length; i++) {
+                if (!sessions[i].complete && !byProfile[sessions[i].profile]) {
+                    byProfile[sessions[i].profile] = sessions[i];
+                }
+            }
+            var hasAny = false;
+            for (var k in byProfile) {
+                hasAny = true;
+                break;
+            }
+            if (!androidSyncActive) showProgressTab(hasAny);
+            if (!isAndroid()) return;
+
+            var pullButtons = el.querySelectorAll("button[data-profile]");
+            for (var i = 0; i < pullButtons.length; i++) {
+                var b = pullButtons[i];
+                var name = b.getAttribute("data-profile");
+                var s = byProfile[name];
+                if (androidSyncActive) {
+                    b.disabled = true;
+                    if (name === androidSyncProfile) {
+                        b.textContent = androidSyncDirection === "push" ? "Sending\u2026" : "Syncing\u2026";
+                    }
+                } else if (s) {
+                    b.disabled = false;
+                    b.textContent = s.direction === "push" ? "Resume upload" : "Resume sync";
+                } else {
+                    b.disabled = false;
+                    b.textContent = "Sync Now";
+                }
+            }
+
+            var pushButtons = el.querySelectorAll("button[data-push]");
+            for (var i = 0; i < pushButtons.length; i++) {
+                var b = pushButtons[i];
+                var name = b.getAttribute("data-push");
+                var s = byProfile[name];
+                if (androidSyncActive) {
+                    b.disabled = true;
+                    if (name === androidSyncProfile) {
+                        b.textContent = androidSyncDirection === "push" ? "Sending\u2026" : "Syncing\u2026";
+                    }
+                } else if (s) {
+                    b.disabled = false;
+                    b.textContent = "Resume upload";
+                } else {
+                    b.disabled = false;
+                    b.textContent = "Send to PC";
+                }
+            }
+        }).catch(function () {
+            // Leave the cards as rendered if the status call fails.
+        });
+    }
+
     // --- Screens ---
 
     function renderHome(el) {
@@ -213,6 +458,7 @@
             }
 
             el.innerHTML = html;
+            applyHomeActions();
 
             // Bind chip click handlers
             var chipContainers = el.querySelectorAll(".dest-chips");
@@ -278,12 +524,28 @@
     }
 
     function triggerSync(profileName, btn) {
+        if (androidSyncActive) {
+            alert("A sync is already running.");
+            return;
+        }
+        if (pollInterval) {
+            clearInterval(pollInterval);
+            pollInterval = null;
+        }
         btn.disabled = true;
         btn.textContent = "Starting...";
 
         if (isAndroid()) {
-            // Android picks its own destination folder via SAF; there is no
-            // server-side destination list to select.
+            // Mark busy immediately: the SAF manifest walk can take a moment,
+            // and Home must not offer a second start during it.
+            androidSyncProfile = profileName;
+            androidSyncDirection = "pull";
+            androidSyncDone = 0;
+            androidSyncTotal = 0;
+            androidSyncErrors = 0;
+            androidSyncCurrent = "";
+            setAndroidSyncActive(true);
+            applyHomeActions();
             syncToDevice(profileName, btn);
             return;
         }
@@ -297,7 +559,6 @@
         }
 
         api("POST", "/web/sync", { profile: profileName, destinations: selected }).then(function () {
-            currentSession = "web";
             showProgressTab(true);
             setProgressPulse(true);
             navigate("progress");
@@ -373,10 +634,22 @@
             var sessionPath = startResp.session;
             var files = startResp.files || [];
             var delta = startResp.delta || { to_delete: [] };
+
+            // Files already done in a resumed session are counted up front so
+            // the progress never restarts at zero.
+            var queue = [];
             var done = 0;
+            for (var i = 0; i < files.length; i++) {
+                if (files[i].state === "done") {
+                    done++;
+                } else {
+                    queue.push(files[i]);
+                }
+            }
+            var total = files.length;
             var errors = 0;
 
-            if (files.length === 0) {
+            if (total === 0) {
                 // An empty delta still gets a session, and in mirror mode it
                 // can carry deletions. Route through the normal finish path so
                 // they are applied before completing.
@@ -388,42 +661,59 @@
                 return;
             }
 
+            if (pollInterval) {
+                clearInterval(pollInterval);
+                pollInterval = null;
+            }
             showProgressTab(true);
             setProgressPulse(true);
-            androidSyncActive = true;
+            androidSyncStopRequested = false;
+            androidSyncDirection = "pull";
+            androidSyncCanStop = queue.length > 0;
+            androidSyncCurrent = queue.length > 0 ? queue[0].path : "";
+            setAndroidSyncActive(true);
+            pausedSession = null;
             navigate("progress");
-            updateSyncProgress(profileName, 0, files.length, 0);
+            updateSyncProgress(profileName, done, total, errors, androidSyncCurrent);
+
+            var index = 0;
 
             function syncNext() {
-                if (done + errors >= files.length) {
-                    finishAndroidSync(profileName, sessionPath, delta, done, files.length, errors);
+                if (androidSyncStopRequested) {
+                    pauseAndroidSync();
+                    return;
+                }
+                if (index >= queue.length) {
+                    androidSyncCanStop = false;
+                    androidSyncCurrent = "";
+                    updateSyncProgress(profileName, done, total, errors, "");
+                    finishAndroidSync(profileName, sessionPath, delta, done, total, errors);
                     return;
                 }
 
-                var f = files[done + errors];
-
-                // Files already completed in a resumed session need neither a
-                // transfer nor a local hash — the server verified them before
-                // marking them done.
-                if (f.state === "done") {
-                    done++;
-                    syncNext();
-                    return;
-                }
-
-                updateSyncProgress(profileName, done, files.length, errors);
+                var f = queue[index++];
+                androidSyncCurrent = f.path;
+                updateSyncProgress(profileName, done, total, errors, f.path);
 
                 // A SHA256 on a pending file means the local copy is
                 // size+mtime-ambiguous: hash it and confirm if it already
                 // matches, otherwise (re)transfer.
                 if (f.sha256) {
                     verifyAndroidFile(profileName, sessionPath, f.path, f.sha256, function (verified) {
+                        if (androidSyncStopRequested) {
+                            pauseAndroidSync();
+                            return;
+                        }
                         if (verified) {
                             done++;
                             syncNext();
                             return;
                         }
                         fetchAndroidFileWithRetry(profileName, sessionPath, f.path, function (ok) {
+                            if (androidSyncStopRequested) {
+                                pauseAndroidSync();
+                                return;
+                            }
                             if (ok) {
                                 done++;
                             } else {
@@ -436,6 +726,10 @@
                 }
 
                 fetchAndroidFileWithRetry(profileName, sessionPath, f.path, function (ok) {
+                    if (androidSyncStopRequested) {
+                        pauseAndroidSync();
+                        return;
+                    }
                     if (ok) {
                         done++;
                     } else {
@@ -447,8 +741,14 @@
 
             syncNext();
         }).catch(function (err) {
+            setAndroidSyncActive(false);
+            androidSyncCanStop = false;
             btn.disabled = false;
             btn.textContent = "Sync Now";
+            if (activeScreen === "home") applyHomeActions();
+            if (pausedSession && activeScreen === "progress") {
+                renderPausedProgress();
+            }
             alert(err.error || "Failed to start sync");
         });
     }
@@ -506,6 +806,10 @@
         function tryOnce() {
             attempt++;
             fetchAndroidFile(profileName, sessionPath, filePath, function (ok) {
+                if (androidSyncStopRequested) {
+                    onDone(false);
+                    return;
+                }
                 if (ok || attempt >= 3) {
                     onDone(ok);
                     return;
@@ -554,6 +858,7 @@
             var fetchOpts = { headers: { "X-Presync-Token": token } };
             if (typeof AbortController !== "undefined") {
                 abortController = new AbortController();
+                androidSyncAbort = abortController;
                 fetchOpts.signal = abortController.signal;
                 // Per-file watchdog: a hung fetch must not stall the loop forever
                 setTimeout(function () { abortController.abort(); }, 5 * 60 * 1000);
@@ -573,6 +878,11 @@
                 var failed = false;
 
                 function pump() {
+                    if (androidSyncStopRequested) {
+                        try { reader.cancel(); } catch (e) { /* already closed */ }
+                        onDone(false);
+                        return;
+                    }
                     return reader.read().then(function (result) {
                         if (failed) return;
                         if (result.done) {
@@ -672,11 +982,13 @@
     // Applies mirror-mode deletions, then completes the session.
     function finishAndroidSync(profileName, sessionPath, delta, done, total, errors, onDone) {
         // Never apply deletions or complete a session after a failed transfer:
-        // the session stays resumable and the next run retries it.
+        // the session stays resumable and Resume retries it.
         if (errors > 0) {
-            androidSyncActive = false;
-            setProgressPulse(false);
-            updateSyncProgress(profileName, done, total, errors);
+            androidSyncDone = done;
+            androidSyncTotal = total;
+            androidSyncErrors = errors;
+            androidSyncCurrent = "";
+            pauseAndroidSync();
             if (onDone) onDone(false);
             return;
         }
@@ -693,9 +1005,11 @@
         function next() {
             if (i >= deletes.length) {
                 if (deleteErrors > 0) {
-                    androidSyncActive = false;
-                    setProgressPulse(false);
-                    updateSyncProgress(profileName, done, total, errors + deleteErrors);
+                    androidSyncDone = done;
+                    androidSyncTotal = total;
+                    androidSyncErrors = errors + deleteErrors;
+                    androidSyncCurrent = "";
+                    pauseAndroidSync();
                     if (onDone) onDone(false);
                     return;
                 }
@@ -725,13 +1039,27 @@
                 return data;
             });
         }).then(function () {
-            androidSyncActive = false;
+            setAndroidSyncActive(false);
             setProgressPulse(false);
-            updateSyncProgress("", done, total, errors);
+            androidSyncCanStop = false;
+            pausedSession = null;
+            showProgressTab(false);
+            renderSyncCard({
+                profile: androidSyncProfile,
+                done: done,
+                total: total,
+                errors: errors,
+                complete: true
+            });
+            if (activeScreen === "home") applyHomeActions();
             if (onDone) onDone(true);
         }).catch(function () {
-            androidSyncActive = false;
-            setProgressPulse(false);
+            // The server kept the session: offer Resume instead of losing it.
+            androidSyncDone = done;
+            androidSyncTotal = total;
+            androidSyncErrors = errors;
+            androidSyncCurrent = "";
+            pauseAndroidSync();
             if (onDone) onDone(false);
         });
     }
@@ -739,13 +1067,34 @@
     // --- Push (phone -> PC) ---
 
     function pushToDevice(profileName, btn) {
+        if (androidSyncActive) {
+            alert("A sync is already running.");
+            return;
+        }
+        if (pollInterval) {
+            clearInterval(pollInterval);
+            pollInterval = null;
+        }
+        androidSyncProfile = profileName;
+        androidSyncDirection = "push";
+        androidSyncDone = 0;
+        androidSyncTotal = 0;
+        androidSyncErrors = 0;
+        androidSyncCurrent = "";
+        setAndroidSyncActive(true);
         btn.disabled = true;
         btn.textContent = "Reading folder...";
+        applyHomeActions();
 
         window.AndroidBridge.pushBuildManifest(profileName, bridgeCallback(function (manifestRes) {
             if (!manifestRes.success) {
+                setAndroidSyncActive(false);
                 btn.disabled = false;
                 btn.textContent = "Send to PC";
+                if (activeScreen === "home") applyHomeActions();
+                if (pausedSession && activeScreen === "progress") {
+                    renderPausedProgress();
+                }
                 alert(manifestRes.data || "Could not read the upload folder");
                 return;
             }
@@ -764,8 +1113,13 @@
                     window.AndroidBridge.saveDeviceId(deviceId);
                     startAndroidPush(profileName, btn, deviceId, manifest);
                 }).catch(function (err) {
+                    setAndroidSyncActive(false);
                     btn.disabled = false;
                     btn.textContent = "Send to PC";
+                    if (activeScreen === "home") applyHomeActions();
+                    if (pausedSession && activeScreen === "progress") {
+                        renderPausedProgress();
+                    }
                     alert(err.error || "Failed to get device ID");
                 });
                 return;
@@ -776,7 +1130,7 @@
     }
 
     function startAndroidPush(profileName, btn, deviceId, sourceManifest) {
-        btn.textContent = "Starting...";
+        btn.textContent = "Sending\u2026";
 
         fetch("/push", {
             method: "POST",
@@ -797,31 +1151,63 @@
         }).then(function (startResp) {
             var files = startResp.files || [];
 
-            if (files.length === 0) {
+            var queue = [];
+            var done = 0;
+            for (var i = 0; i < files.length; i++) {
+                if (files[i].state === "done") {
+                    done++;
+                } else {
+                    queue.push(files[i]);
+                }
+            }
+            var total = files.length;
+            var errors = 0;
+
+            if (total === 0) {
                 completeAndroidPush(startResp.session, btn, profileName, 0, 0, 0);
                 alert("Already up to date");
                 return;
             }
 
+            if (pollInterval) {
+                clearInterval(pollInterval);
+                pollInterval = null;
+            }
             showProgressTab(true);
             setProgressPulse(true);
-            androidSyncActive = true;
+            androidSyncStopRequested = false;
+            androidSyncDirection = "push";
+            androidSyncCanStop = queue.length > 0;
+            androidSyncCurrent = queue.length > 0 ? queue[0].path : "";
+            setAndroidSyncActive(true);
+            pausedSession = null;
             navigate("progress");
-            updateSyncProgress(profileName, 0, files.length, 0);
+            updateSyncProgress(profileName, done, total, errors, androidSyncCurrent);
 
-            var done = 0;
-            var errors = 0;
+            var index = 0;
 
             function next() {
-                if (done + errors >= files.length) {
-                    finishAndroidPush(profileName, startResp.session, btn, done, files.length, errors);
+                if (androidSyncStopRequested) {
+                    pauseAndroidSync();
+                    return;
+                }
+                if (index >= queue.length) {
+                    androidSyncCanStop = false;
+                    androidSyncCurrent = "";
+                    updateSyncProgress(profileName, done, total, errors, "");
+                    finishAndroidPush(profileName, startResp.session, btn, done, total, errors);
                     return;
                 }
 
-                var f = files[done + errors];
-                updateSyncProgress(profileName, done, files.length, errors);
+                var f = queue[index++];
+                androidSyncCurrent = f.path;
+                updateSyncProgress(profileName, done, total, errors, f.path);
 
                 uploadPushFile(profileName, startResp.session, f, function (ok) {
+                    if (androidSyncStopRequested) {
+                        pauseAndroidSync();
+                        return;
+                    }
                     if (ok) {
                         done++;
                     } else {
@@ -833,8 +1219,14 @@
 
             next();
         }).catch(function (err) {
+            setAndroidSyncActive(false);
+            androidSyncCanStop = false;
             btn.disabled = false;
             btn.textContent = "Send to PC";
+            if (activeScreen === "home") applyHomeActions();
+            if (pausedSession && activeScreen === "progress") {
+                renderPausedProgress();
+            }
             alert(err.error || "Failed to start upload");
         });
     }
@@ -843,15 +1235,27 @@
         var attempt = 0;
 
         function tryFrom(offset) {
+            if (androidSyncStopRequested) {
+                onDone(false);
+                return;
+            }
             attempt++;
 
             uploadPushChunks(profileName, sessionPath, file.path, offset, function (ok) {
+                if (androidSyncStopRequested) {
+                    onDone(false);
+                    return;
+                }
                 if (!ok) {
                     retryOrFail();
                     return;
                 }
 
                 confirmPushFile(profileName, sessionPath, file.path, function (confirmed) {
+                    if (androidSyncStopRequested) {
+                        onDone(false);
+                        return;
+                    }
                     if (confirmed) {
                         onDone(true);
                         return;
@@ -862,6 +1266,10 @@
         }
 
         function retryOrFail() {
+            if (androidSyncStopRequested) {
+                onDone(false);
+                return;
+            }
             if (attempt >= 3) {
                 reportPushError(sessionPath, file.path);
                 onDone(false);
@@ -881,7 +1289,15 @@
         var CHUNK_BYTES = 256 * 1024;
 
         function readNext(at) {
+            if (androidSyncStopRequested) {
+                onDone(false);
+                return;
+            }
             window.AndroidBridge.pushReadChunk(profileName, filePath, at, CHUNK_BYTES, bridgeCallback(function (res) {
+                if (androidSyncStopRequested) {
+                    onDone(false);
+                    return;
+                }
                 if (!res.success) {
                     onDone(false);
                     return;
@@ -1018,11 +1434,13 @@
 
     function finishAndroidPush(profileName, sessionPath, btn, done, total, errors) {
         if (errors > 0) {
-            androidSyncActive = false;
-            setProgressPulse(false);
-            updateSyncProgress(profileName, done, total, errors);
             btn.disabled = false;
             btn.textContent = "Send to PC";
+            androidSyncDone = done;
+            androidSyncTotal = total;
+            androidSyncErrors = errors;
+            androidSyncCurrent = "";
+            pauseAndroidSync();
             return;
         }
         completeAndroidPush(sessionPath, btn, profileName, done, total, errors);
@@ -1045,12 +1463,26 @@
                 return data;
             });
         }).then(function () {
-            androidSyncActive = false;
+            setAndroidSyncActive(false);
             setProgressPulse(false);
-            updateSyncProgress("", done, total, errors);
+            androidSyncCanStop = false;
+            pausedSession = null;
+            showProgressTab(false);
+            renderSyncCard({
+                profile: profileName,
+                done: done,
+                total: total,
+                errors: errors,
+                complete: true
+            });
+            if (activeScreen === "home") applyHomeActions();
         }).catch(function () {
-            androidSyncActive = false;
-            setProgressPulse(false);
+            // The server kept the session: Resume can finish the upload.
+            androidSyncDone = done;
+            androidSyncTotal = total;
+            androidSyncErrors = errors;
+            androidSyncCurrent = "";
+            pauseAndroidSync();
         });
     }
 
@@ -1063,34 +1495,36 @@
         return bytes;
     }
 
-    function updateSyncProgress(profileName, done, total, errors) {
-        var pct = total > 0 ? Math.round((done / total) * 100) : 0;
-        var el = document.getElementById("content");
-        if (activeScreen !== "progress") return;
-        el.innerHTML =
-            '<h1>Sync Progress</h1>' +
-            '<div class="card">' +
-            '<div class="card-title">' + esc(profileName) + "</div>" +
-            '<div class="card-subtitle">' + done + " of " + total + " files" +
-            (errors > 0 ? ' &middot; <span style="color:var(--status-error)">' + errors + " errors</span>" : "") +
-            "</div>" +
-            '<div class="progress-bar" style="margin-top:var(--space-2)">' +
-            '<div class="progress-fill" style="width:' + pct + '%"></div>' +
-            "</div>" +
-            "</div>";
+    function updateSyncProgress(profileName, done, total, errors, current) {
+        if (profileName) androidSyncProfile = profileName;
+        androidSyncDone = done;
+        androidSyncTotal = total;
+        androidSyncErrors = errors;
+        androidSyncCurrent = current || "";
+
+        renderSyncCard({
+            profile: androidSyncProfile,
+            done: done,
+            total: total,
+            errors: errors,
+            current: androidSyncCurrent,
+            running: androidSyncActive,
+            canStop: androidSyncActive && androidSyncCanStop,
+            direction: androidSyncDirection
+        });
     }
 
     function renderProgress(el) {
         if (androidSyncActive) {
-            // The Android sync loop drives its own progress display.
-            el.innerHTML = '<h1>Sync Progress</h1><div class="loading">Syncing...</div>';
+            updateSyncProgress(androidSyncProfile, androidSyncDone, androidSyncTotal, androidSyncErrors, androidSyncCurrent);
             return;
         }
-        el.innerHTML = '<h1>Sync Progress</h1><div class="loading">Loading...</div>';
+        if (pausedSession) {
+            renderPausedProgress();
+            return;
+        }
 
-        var lastDone = -1;
-        var lastErrors = -1;
-        var stallCount = 0;
+        el.innerHTML = '<h1>Sync Progress</h1><div class="loading">Loading...</div>';
 
         function refresh() {
             api("GET", "/web/sessions").then(function (data) {
@@ -1104,55 +1538,38 @@
                 }
 
                 if (!active) {
-                    if (currentSession) {
-                        el.innerHTML =
-                            '<h1>Sync Progress</h1>' +
-                            '<div class="card"><div class="empty-state">' +
-                            "<p>Sync complete</p>" +
-                            "</div></div>";
-                    } else {
-                        el.innerHTML =
-                            '<h1>Sync Progress</h1>' +
-                            '<div class="card"><div class="empty-state">' +
-                            "<p>No active sync</p>" +
-                            '<p>Start a sync from the Home screen</p>' +
-                            "</div></div>";
-                    }
+                    el.innerHTML =
+                        '<h1>Sync Progress</h1>' +
+                        '<div class="card"><div class="empty-state">' +
+                        "<p>No active sync</p>" +
+                        '<p>Start a sync from the Home screen</p>' +
+                        "</div></div>";
                     showProgressTab(false);
                     setProgressPulse(false);
-                    stallCount = 0;
                     return;
                 }
 
-                if (active.done === lastDone && active.errors === lastErrors) {
-                    stallCount++;
-                } else {
-                    stallCount = 0;
-                }
-                lastDone = active.done;
-                lastErrors = active.errors;
-
-                // Progress only advances per file, so a large single file
-                // stalls the counters — never hide the tab for that. Show the
-                // warning only after 60s of no change.
-                var stalled = stallCount >= 60;
-
-                var pct = active.total > 0 ? Math.round((active.done / active.total) * 100) : 0;
-
-                var html =
-                    '<h1>Sync Progress</h1>' +
-                    '<div class="card">' +
-                    '<div class="card-title">' + esc(active.profile) + "</div>" +
-                    '<div class="card-subtitle">' + active.done + " of " + active.total + " files" +
-                    (active.errors > 0 ? ' &middot; <span style="color:var(--status-error)">' + active.errors + " errors</span>" : "") +
-                    (stalled ? ' <span style="color:var(--status-warning)">&middot; appears stalled</span>' : "") +
-                    "</div>" +
-                    '<div class="progress-bar" style="margin-top:var(--space-2)">' +
-                    '<div class="progress-fill" style="width:' + pct + '%"></div>' +
-                    "</div>" +
-                    "</div>";
-
-                el.innerHTML = html;
+                showProgressTab(true);
+                var canResume = isAndroid();
+                renderSyncCard({
+                    profile: active.profile,
+                    done: active.done,
+                    total: active.total,
+                    errors: active.errors,
+                    current: active.current,
+                    running: false,
+                    canStop: false,
+                    canResume: canResume,
+                    direction: active.direction,
+                    tone: canResume ? "paused" : "external",
+                    onResume: canResume ? function (btn) {
+                        if (active.direction === "push") {
+                            pushToDevice(active.profile, btn);
+                        } else {
+                            triggerSync(active.profile, btn);
+                        }
+                    } : null
+                });
             }).catch(function () {
                 el.innerHTML =
                     '<h1>Sync Progress</h1>' +
@@ -1163,7 +1580,7 @@
         }
 
         refresh();
-        pollInterval = setInterval(refresh, 1000);
+        pollInterval = setInterval(refresh, 2000);
     }
 
     function renderProfiles(el) {
@@ -1436,27 +1853,34 @@
                             };
 
                             if (isAndroid()) {
-                                window.AndroidBridge.saveToken(result.token);
-                                window.AndroidBridge.saveServerUrl(location.origin);
-                                if (result.device_id) {
-                                    window.AndroidBridge.saveDeviceId(result.device_id);
-                                }
-
                                 confirmBtn.textContent = "Pick a folder\u2026";
                                 pinDisplay.textContent = "Paired!";
                                 pinDisplay.style.color = "var(--status-success)";
 
-                                window.onDestinationPicked = function (pickResult) {
-                                    if (pickResult.success) {
-                                        goHome();
-                                    } else {
-                                        pinDisplay.textContent = "No folder selected";
-                                        pinDisplay.style.color = "var(--status-warning)";
-                                        setTimeout(goHome, 1500);
+                                try {
+                                    window.AndroidBridge.saveToken(result.token);
+                                    window.AndroidBridge.saveServerUrl(location.origin);
+                                    if (result.device_id) {
+                                        window.AndroidBridge.saveDeviceId(result.device_id);
                                     }
-                                };
 
-                                window.AndroidBridge.pickDestinationFolder();
+                                    window.onDestinationPicked = function (pickResult) {
+                                        if (pickResult.success) {
+                                            goHome();
+                                        } else {
+                                            pinDisplay.textContent = "No folder selected";
+                                            pinDisplay.style.color = "var(--status-warning)";
+                                            setTimeout(goHome, 1500);
+                                        }
+                                    };
+
+                                    window.AndroidBridge.pickDestinationFolder();
+                                } catch (e) {
+                                    pinDisplay.textContent = "Paired, but setup failed";
+                                    pinDisplay.style.color = "var(--status-error)";
+                                    errorEl.textContent = "Could not finish setup on this device: " +
+                                        (e && e.message ? e.message : String(e));
+                                }
                             } else {
                                 localStorage.setItem("presync_token", result.token);
                                 if (result.device_id) {
@@ -1500,11 +1924,13 @@
             token = storedToken;
             window.addEventListener("hashchange", onHashChange);
             render(getHash());
+            refreshProgressTab();
         } else {
             api("GET", "/web/token").then(function (data) {
                 token = data.token;
                 window.addEventListener("hashchange", onHashChange);
                 render(getHash());
+                refreshProgressTab();
             }).catch(function () {
                 document.getElementById("content").innerHTML =
                     '<div class="card"><div class="empty-state">' +

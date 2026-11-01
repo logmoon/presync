@@ -331,3 +331,273 @@ func TestHandleSyncStart_ResumeRequeuesDoneFileMissingAtDestination(t *testing.T
 		t.Fatalf("a.txt missing from response: %+v", resp.Files)
 	}
 }
+
+func TestHandleSyncStart_ResumeIgnoresDestinationMTime(t *testing.T) {
+	_, srcDir := setupSyncHandlerTest(t, map[string]string{"a.txt": "hello", "b.txt": "world"})
+
+	srcManifest, err := diff.BuildManifest(srcDir)
+	if err != nil {
+		t.Fatalf("building source manifest: %v", err)
+	}
+	srcIndex := manifestIndex(srcManifest)
+	a, b := srcIndex["a.txt"], srcIndex["b.txt"]
+
+	hash, err := transfer.ComputeFileHash(filepath.Join(srcDir, "a.txt"))
+	if err != nil {
+		t.Fatalf("hashing source: %v", err)
+	}
+
+	sess := transfer.NewSession("dev1", "music", []string{"a.txt", "b.txt"})
+	sess.SetFileMeta("a.txt", a.Size, a.ModTime)
+	sess.SetFileMeta("b.txt", b.Size, b.ModTime)
+	sess.MarkDone("a.txt", hash)
+	if err := sess.Save(); err != nil {
+		t.Fatalf("saving session: %v", err)
+	}
+
+	// a.txt is present at the destination with the right size but a different
+	// mtime (Android SAF writes a fresh one). b.txt is missing, keeping the
+	// session incomplete and forcing the resume path.
+	dst := diff.Manifest{Files: []diff.FileEntry{
+		{Path: "a.txt", Size: a.Size, ModTime: a.ModTime + 5000},
+	}}
+	body, _ := json.Marshal(map[string]interface{}{
+		"device_id":            "dev1",
+		"profile":              "music",
+		"destination_manifest": dst,
+	})
+	req := httptest.NewRequest(http.MethodPost, "/sync", bytes.NewReader(body))
+	w := httptest.NewRecorder()
+	handleSyncStart()(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp syncStartResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decoding response: %v", err)
+	}
+	states := make(map[string]string, len(resp.Files))
+	for _, f := range resp.Files {
+		states[f.Path] = f.State
+	}
+	if states["a.txt"] != string(transfer.FileDone) {
+		t.Errorf("done file was re-queued because of its destination mtime: %q", states["a.txt"])
+	}
+	if states["b.txt"] != string(transfer.FilePending) {
+		t.Errorf("expected b.txt pending, got %q", states["b.txt"])
+	}
+}
+
+func TestHandleSyncStart_ResumeRequeuesChangedSource(t *testing.T) {
+	_, srcDir := setupSyncHandlerTest(t, map[string]string{"a.txt": "hello", "b.txt": "world"})
+
+	srcManifest, err := diff.BuildManifest(srcDir)
+	if err != nil {
+		t.Fatalf("building source manifest: %v", err)
+	}
+	srcIndex := manifestIndex(srcManifest)
+	a, b := srcIndex["a.txt"], srcIndex["b.txt"]
+
+	hash, err := transfer.ComputeFileHash(filepath.Join(srcDir, "a.txt"))
+	if err != nil {
+		t.Fatalf("hashing source: %v", err)
+	}
+
+	sess := transfer.NewSession("dev1", "music", []string{"a.txt", "b.txt"})
+	// The recorded source metadata is stale: the source changed since.
+	sess.SetFileMeta("a.txt", a.Size, a.ModTime-10)
+	sess.SetFileMeta("b.txt", b.Size, b.ModTime)
+	sess.MarkDone("a.txt", hash)
+	if err := sess.Save(); err != nil {
+		t.Fatalf("saving session: %v", err)
+	}
+
+	dst := diff.Manifest{Files: []diff.FileEntry{
+		{Path: "a.txt", Size: a.Size, ModTime: a.ModTime + 5000},
+	}}
+	body, _ := json.Marshal(map[string]interface{}{
+		"device_id":            "dev1",
+		"profile":              "music",
+		"destination_manifest": dst,
+	})
+	req := httptest.NewRequest(http.MethodPost, "/sync", bytes.NewReader(body))
+	w := httptest.NewRecorder()
+	handleSyncStart()(w, req)
+
+	var resp syncStartResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decoding response: %v", err)
+	}
+	for _, f := range resp.Files {
+		if f.Path == "a.txt" && f.State != string(transfer.FilePending) {
+			t.Errorf("changed source file must be re-queued, got %q", f.State)
+		}
+	}
+}
+
+func TestHandleSyncStart_SecondSyncAfterCompleteTransfersNothing(t *testing.T) {
+	_, srcDir := setupSyncHandlerTest(t, map[string]string{"a.txt": "hello", "b.txt": "world"})
+
+	srcManifest, err := diff.BuildManifest(srcDir)
+	if err != nil {
+		t.Fatalf("building source manifest: %v", err)
+	}
+	srcIndex := manifestIndex(srcManifest)
+
+	sess := transfer.NewSession("dev1", "music", []string{"a.txt", "b.txt"})
+	for _, f := range srcManifest.Files {
+		hash, err := transfer.ComputeFileHash(filepath.Join(srcDir, f.Path))
+		if err != nil {
+			t.Fatalf("hashing %s: %v", f.Path, err)
+		}
+		sess.SetFileMeta(f.Path, f.Size, f.ModTime)
+		sess.MarkDone(f.Path, hash)
+	}
+	if err := sess.Save(); err != nil {
+		t.Fatalf("saving session: %v", err)
+	}
+
+	completeBody, _ := json.Marshal(map[string]string{"session": sess.Path})
+	completeReq := httptest.NewRequest(http.MethodPost, "/sync/complete", bytes.NewReader(completeBody))
+	completeW := httptest.NewRecorder()
+	handleSyncComplete()(completeW, completeReq)
+	if completeW.Code != http.StatusOK {
+		t.Fatalf("complete returned %d: %s", completeW.Code, completeW.Body.String())
+	}
+
+	state, err := transfer.LoadState("dev1", "music")
+	if err != nil {
+		t.Fatalf("loading state: %v", err)
+	}
+	if state == nil || len(state.Files) != 2 {
+		t.Fatalf("expected 2 baseline entries, got %+v", state)
+	}
+
+	// Second sync: the recipient reports both files with Android-style mtimes.
+	dst := diff.Manifest{Files: []diff.FileEntry{
+		{Path: "a.txt", Size: srcIndex["a.txt"].Size, ModTime: srcIndex["a.txt"].ModTime + 5000},
+		{Path: "b.txt", Size: srcIndex["b.txt"].Size, ModTime: srcIndex["b.txt"].ModTime + 5000},
+	}}
+	body, _ := json.Marshal(map[string]interface{}{
+		"device_id":            "dev1",
+		"profile":              "music",
+		"destination_manifest": dst,
+	})
+	req := httptest.NewRequest(http.MethodPost, "/sync", bytes.NewReader(body))
+	w := httptest.NewRecorder()
+	handleSyncStart()(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp syncStartResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decoding response: %v", err)
+	}
+	if len(resp.Delta.ToAdd) != 0 || len(resp.Delta.ToUpdate) != 0 || len(resp.Delta.ToDelete) != 0 {
+		t.Errorf("expected an empty delta on an unchanged second sync, got add=%v update=%v delete=%v",
+			resp.Delta.ToAdd, resp.Delta.ToUpdate, resp.Delta.ToDelete)
+	}
+	if len(resp.Files) != 0 {
+		t.Errorf("expected no files to transfer, got %+v", resp.Files)
+	}
+}
+
+func TestHandleSyncStart_LegacyDoneSameSizeChangeRequeues(t *testing.T) {
+	_, srcDir := setupSyncHandlerTest(t, map[string]string{"a.txt": "hello", "b.txt": "world"})
+
+	oldHash, err := transfer.ComputeFileHash(filepath.Join(srcDir, "a.txt"))
+	if err != nil {
+		t.Fatalf("hashing old source: %v", err)
+	}
+
+	// Same size, different content: only a hash comparison can detect it.
+	if err := os.WriteFile(filepath.Join(srcDir, "a.txt"), []byte("HELLO"), 0o644); err != nil {
+		t.Fatalf("rewriting source: %v", err)
+	}
+	srcManifest, err := diff.BuildManifest(srcDir)
+	if err != nil {
+		t.Fatalf("building source manifest: %v", err)
+	}
+	a := manifestIndex(srcManifest)["a.txt"]
+
+	// Legacy session: done entry with the old hash and no source metadata.
+	sess := transfer.NewSession("dev1", "music", []string{"a.txt", "b.txt"})
+	sess.MarkDone("a.txt", oldHash)
+	if err := sess.Save(); err != nil {
+		t.Fatalf("saving session: %v", err)
+	}
+
+	dst := diff.Manifest{Files: []diff.FileEntry{
+		{Path: "a.txt", Size: a.Size, ModTime: 0},
+	}}
+	body, _ := json.Marshal(map[string]interface{}{
+		"device_id":            "dev1",
+		"profile":              "music",
+		"destination_manifest": dst,
+	})
+	req := httptest.NewRequest(http.MethodPost, "/sync", bytes.NewReader(body))
+	w := httptest.NewRecorder()
+	handleSyncStart()(w, req)
+
+	var resp syncStartResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decoding response: %v", err)
+	}
+	for _, f := range resp.Files {
+		if f.Path == "a.txt" && f.State != string(transfer.FilePending) {
+			t.Errorf("legacy same-size change must re-queue, got %q", f.State)
+		}
+	}
+}
+
+func TestHandleSyncStart_LegacyDoneMatchingHashSeedsMetadata(t *testing.T) {
+	_, srcDir := setupSyncHandlerTest(t, map[string]string{"a.txt": "hello", "b.txt": "world"})
+
+	hash, err := transfer.ComputeFileHash(filepath.Join(srcDir, "a.txt"))
+	if err != nil {
+		t.Fatalf("hashing source: %v", err)
+	}
+	srcManifest, err := diff.BuildManifest(srcDir)
+	if err != nil {
+		t.Fatalf("building source manifest: %v", err)
+	}
+	a := manifestIndex(srcManifest)["a.txt"]
+
+	sess := transfer.NewSession("dev1", "music", []string{"a.txt", "b.txt"})
+	sess.MarkDone("a.txt", hash)
+	if err := sess.Save(); err != nil {
+		t.Fatalf("saving session: %v", err)
+	}
+
+	dst := diff.Manifest{Files: []diff.FileEntry{
+		{Path: "a.txt", Size: a.Size, ModTime: 0},
+	}}
+	body, _ := json.Marshal(map[string]interface{}{
+		"device_id":            "dev1",
+		"profile":              "music",
+		"destination_manifest": dst,
+	})
+	req := httptest.NewRequest(http.MethodPost, "/sync", bytes.NewReader(body))
+	w := httptest.NewRecorder()
+	handleSyncStart()(w, req)
+
+	var resp syncStartResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decoding response: %v", err)
+	}
+	reloaded, err := transfer.LoadSession(resp.Session)
+	if err != nil {
+		t.Fatalf("reloading session: %v", err)
+	}
+	f := reloaded.GetFile("a.txt")
+	if f == nil || f.State != transfer.FileDone {
+		t.Fatalf("matching legacy file should stay done: %+v", f)
+	}
+	if f.ModTime == 0 || f.Size != a.Size {
+		t.Errorf("expected source metadata to be seeded, got size=%d mtime=%d", f.Size, f.ModTime)
+	}
+}

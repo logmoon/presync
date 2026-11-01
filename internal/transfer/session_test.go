@@ -425,7 +425,7 @@ func TestUpsertFileResetsState(t *testing.T) {
 	sess.UpdateOffset("a", 12)
 	sess.Files[0].Attempts = 2
 
-	sess.UpsertFile("a", 42)
+	sess.UpsertFile("a", 42, 1000)
 	f := sess.GetFile("a")
 	if f.State != FilePending {
 		t.Errorf("state: got %q, want pending", f.State)
@@ -433,11 +433,11 @@ func TestUpsertFileResetsState(t *testing.T) {
 	if f.Offset != 0 || f.Attempts != 0 || f.SHA256 != "" {
 		t.Errorf("stale fields not cleared: %+v", f)
 	}
-	if f.Size != 42 {
-		t.Errorf("size: got %d, want 42", f.Size)
+	if f.Size != 42 || f.ModTime != 1000 {
+		t.Errorf("source metadata: got size=%d mtime=%d, want 42/1000", f.Size, f.ModTime)
 	}
 
-	sess.UpsertFile("b", 7)
+	sess.UpsertFile("b", 7, 2000)
 	if len(sess.Files) != 2 || sess.Files[1].Path != "b" || sess.Files[1].State != FilePending {
 		t.Fatalf("missing file not appended: %+v", sess.Files)
 	}

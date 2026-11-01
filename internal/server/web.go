@@ -1,6 +1,7 @@
 package server
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -8,6 +9,7 @@ import (
 	"path/filepath"
 	"sort"
 	"sync"
+	"time"
 
 	"presync/internal/client"
 	"presync/internal/config"
@@ -15,8 +17,9 @@ import (
 )
 
 const (
-	webDeviceID      = "web-ui"
-	maxSessionReturn = 20
+	webDeviceID             = "web-ui"
+	maxSessionReturn        = 20
+	completedSessionReapAge = 10 * time.Minute
 )
 
 var webSyncActive sync.Map
@@ -178,8 +181,12 @@ func handleWebSync() http.HandlerFunc {
 				if len(req.Destinations) > 0 && !webDestContains(req.Destinations, destName) {
 					continue
 				}
+				// Each destination needs its own session/baseline key: two
+				// destinations for one profile must not share a delta state.
+				sum := sha256.Sum256([]byte(destPath))
+				deviceID := fmt.Sprintf("%s-%x", webDeviceID, sum[:4])
 				logInfo("web sync: profile=%s dest=%s path=%s", req.Profile, destName, destPath)
-				res, err := client.SyncProfile(serverAddr, token, req.Profile, webDeviceID, destPath, false, nil)
+				res, err := client.SyncProfile(serverAddr, token, req.Profile, deviceID, destPath, false, nil)
 				if err != nil {
 					logError("web sync failed for profile %s dest %s: %v", req.Profile, destName, err)
 				} else if res.Errors > 0 {
@@ -200,14 +207,22 @@ func handleWebSessions() http.HandlerFunc {
 		}
 
 		type sessionSummary struct {
-			Path     string `json:"path"`
-			DeviceID string `json:"device_id"`
-			Profile  string `json:"profile"`
-			Total    int    `json:"total"`
-			Done     int    `json:"done"`
-			Errors   int    `json:"errors"`
-			Complete bool   `json:"complete"`
+			Path      string    `json:"path"`
+			DeviceID  string    `json:"device_id"`
+			Profile   string    `json:"profile"`
+			Direction string    `json:"direction"`
+			Total     int       `json:"total"`
+			Done      int       `json:"done"`
+			Errors    int       `json:"errors"`
+			Current   string    `json:"current"`
+			Complete  bool      `json:"complete"`
+			UpdatedAt time.Time `json:"updated_at"`
 		}
+
+		// A paired device only sees its own sessions (including its push
+		// sessions, so upload progress survives tab switches and reloads). The
+		// local token is the PC's own view and keeps showing pull sessions.
+		device, isDevice := config.ValidateToken(r.Header.Get("X-Presync-Token"))
 
 		dir := config.SessionsDir()
 		entries, err := os.ReadDir(dir)
@@ -235,44 +250,69 @@ func handleWebSessions() http.HandlerFunc {
 			if err != nil {
 				continue
 			}
-			if sess.Direction != config.DirectionPull {
-				// Push sessions are driven by the paired device and must not
-				// be surfaced or auto-deleted by the PC web progress poller.
+
+			if isDevice {
+				if sess.DeviceID != device.ID {
+					continue
+				}
+			} else if sess.Direction != config.DirectionPull {
+				// Push sessions are driven by the paired device; the PC view
+				// must not surface or clean them up.
 				continue
 			}
 
-			// Auto-cleanup: delete stale incomplete sessions
-			if !sess.IsComplete() && sess.IsStale() {
-				transfer.DeleteSession(path)
-				continue
-			}
-
-			// Auto-cleanup: delete completed sessions too (they're done)
+			// A client that dies between its last confirm and /complete can
+			// leave a complete session behind. Reap it only after a grace
+			// window so a poll can never race the completion handler.
 			if sess.IsComplete() {
+				if time.Since(sess.LastUpdated) > completedSessionReapAge {
+					transfer.DeleteSession(path)
+				}
+				continue
+			}
+
+			// Stale incomplete sessions are dead (30 minutes of inactivity);
+			// the next sync starts a fresh one. The device's own view may
+			// reap its push sessions; the PC view skips push above.
+			if sess.IsStale() {
 				transfer.DeleteSession(path)
 				continue
 			}
 
 			var done, errors int
+			var current string
 			for _, f := range sess.Files {
 				switch f.State {
 				case transfer.FileDone:
 					done++
 				case transfer.FileError:
 					errors++
+				case transfer.FileInProgress:
+					current = f.Path
 				}
 			}
 
 			sessions = append(sessions, sessionSummary{
-				Path:     sess.Path,
-				DeviceID: sess.DeviceID,
-				Profile:  sess.Profile,
-				Total:    len(sess.Files),
-				Done:     done,
-				Errors:   errors,
-				Complete: sess.IsComplete(),
+				Path:      sess.Path,
+				DeviceID:  sess.DeviceID,
+				Profile:   sess.Profile,
+				Direction: sess.Direction,
+				Total:     len(sess.Files),
+				Done:      done,
+				Errors:    errors,
+				Current:   current,
+				Complete:  sess.IsComplete(),
+				UpdatedAt: sess.LastUpdated,
 			})
 		}
+
+		// Newest first: the UI resumes the most recent session.
+		sort.Slice(sessions, func(i, j int) bool {
+			if sessions[i].UpdatedAt.Equal(sessions[j].UpdatedAt) {
+				return sessions[i].Path > sessions[j].Path
+			}
+			return sessions[i].UpdatedAt.After(sessions[j].UpdatedAt)
+		})
 
 		writeJSON(w, http.StatusOK, map[string]interface{}{"sessions": sessions})
 	}

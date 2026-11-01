@@ -124,6 +124,74 @@ func ComputeHash(path string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
+// ComputeDeltaWithBase compares the source against the last-synced baseline for
+// a device, then verifies the recipient still has each unchanged file. It is
+// used instead of ComputeDelta when the server has a baseline for the device.
+//
+// Destination mtimes are intentionally ignored: clients that cannot preserve
+// them (Android SAF) would otherwise report every already-synced file as
+// changed and cause a full re-transfer on every run. A file is re-sent only
+// when the source changed since the baseline, or when it is missing from the
+// recipient (or present with a different size).
+func ComputeDeltaWithBase(src, dst, base Manifest, mode string) Delta {
+	srcIndex := make(map[string]FileEntry, len(src.Files))
+	for _, f := range src.Files {
+		srcIndex[f.Path] = f
+	}
+
+	dstIndex := make(map[string]FileEntry, len(dst.Files))
+	for _, f := range dst.Files {
+		dstIndex[f.Path] = f
+	}
+
+	baseIndex := make(map[string]FileEntry, len(base.Files))
+	for _, f := range base.Files {
+		baseIndex[f.Path] = f
+	}
+
+	var delta Delta
+
+	for _, srcFile := range src.Files {
+		baseFile, inBase := baseIndex[srcFile.Path]
+		if !inBase {
+			delta.ToAdd = append(delta.ToAdd, FileAction{
+				Path:   srcFile.Path,
+				Reason: "add",
+			})
+			continue
+		}
+
+		if srcFile.Size != baseFile.Size || srcFile.ModTime != baseFile.ModTime {
+			delta.ToUpdate = append(delta.ToUpdate, FileAction{
+				Path:   srcFile.Path,
+				Reason: "update",
+			})
+			continue
+		}
+
+		dstFile, inDst := dstIndex[srcFile.Path]
+		if !inDst || dstFile.Size != srcFile.Size {
+			delta.ToUpdate = append(delta.ToUpdate, FileAction{
+				Path:   srcFile.Path,
+				Reason: "missing",
+			})
+		}
+	}
+
+	if mode == "mirror" {
+		for _, dstFile := range dst.Files {
+			if _, exists := srcIndex[dstFile.Path]; !exists {
+				delta.ToDelete = append(delta.ToDelete, FileAction{
+					Path:   dstFile.Path,
+					Reason: "delete",
+				})
+			}
+		}
+	}
+
+	return delta
+}
+
 func ComputeDelta(src, dst Manifest, mode string) Delta {
 	srcIndex := make(map[string]FileEntry, len(src.Files))
 	for _, f := range src.Files {

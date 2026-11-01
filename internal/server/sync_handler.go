@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"presync/internal/config"
 	"presync/internal/diff"
@@ -171,7 +172,19 @@ func handleSyncStart() http.HandlerFunc {
 			return
 		}
 
-		delta := diff.ComputeDelta(sourceManifest, req.DestinationManifest, profile.Mode)
+		// A per-device baseline makes the delta independent of the recipient's
+		// mtimes (Android SAF cannot preserve them). Without one, fall back to
+		// the destination manifest so first syncs still behave as before.
+		baseline, baseErr := transfer.LoadState(req.DeviceID, req.Profile)
+		if baseErr != nil {
+			logError("loading sync state: %v", baseErr)
+		}
+		var delta diff.Delta
+		if baseline != nil {
+			delta = diff.ComputeDeltaWithBase(sourceManifest, req.DestinationManifest, baseline.Manifest(), profile.Mode)
+		} else {
+			delta = diff.ComputeDelta(sourceManifest, req.DestinationManifest, profile.Mode)
+		}
 
 		var sess *transfer.Session
 		if existing != nil && !existing.IsComplete() {
@@ -183,20 +196,55 @@ func handleSyncStart() http.HandlerFunc {
 		}
 
 		if sess != nil {
-			// Resume: reconcile the session with the freshly computed delta.
-			// A file marked done in the session but missing/changed at the
-			// destination must be transferred again; new source files that
-			// appeared during the pause are added; files removed from the
-			// source are dropped.
+			// Resume: reconcile against the SOURCE, not the destination mtimes.
+			// Done files stay done when the source is unchanged and the
+			// recipient still has them at the right size; files whose source
+			// changed or that vanished at the destination are re-queued.
 			srcIndex := manifestIndex(sourceManifest)
+			dstIndex := manifestIndex(req.DestinationManifest)
+			deltaNeeds := make(map[string]bool, len(delta.ToAdd)+len(delta.ToUpdate))
 			for _, a := range delta.ToAdd {
-				if f, ok := srcIndex[a.Path]; ok {
-					sess.UpsertFile(a.Path, f.Size)
-				}
+				deltaNeeds[a.Path] = true
 			}
 			for _, a := range delta.ToUpdate {
-				if f, ok := srcIndex[a.Path]; ok {
-					sess.UpsertFile(a.Path, f.Size)
+				deltaNeeds[a.Path] = true
+			}
+			for _, sf := range sourceManifest.Files {
+				fs := sess.GetFile(sf.Path)
+				if fs == nil {
+					// Only new work enters the session. Files already current
+					// (per the baseline) are not re-queued on every resume.
+					if deltaNeeds[sf.Path] {
+						sess.UpsertFile(sf.Path, sf.Size, sf.ModTime)
+					}
+					continue
+				}
+
+				sourceChanged := fs.ModTime != 0 && (fs.Size != sf.Size || fs.ModTime != sf.ModTime)
+				dst, inDst := dstIndex[sf.Path]
+				missingAtDestination := !inDst || dst.Size != sf.Size
+				if sourceChanged || missingAtDestination {
+					sess.UpsertFile(sf.Path, sf.Size, sf.ModTime)
+					continue
+				}
+
+				if fs.ModTime == 0 {
+					// Legacy session without source metadata. A done entry is
+					// only safe to seed when the source content still matches
+					// the hash that was delivered; otherwise the file could be
+					// certified as synced without the recipient having it.
+					if fs.State == transfer.FileDone {
+						if fs.SHA256 == "" {
+							sess.UpsertFile(sf.Path, sf.Size, sf.ModTime)
+							continue
+						}
+						hash, err := transfer.ComputeFileHash(filepath.Join(profile.Source, sf.Path))
+						if err != nil || hash != fs.SHA256 {
+							sess.UpsertFile(sf.Path, sf.Size, sf.ModTime)
+							continue
+						}
+					}
+					sess.SetFileMeta(sf.Path, sf.Size, sf.ModTime)
 				}
 			}
 
@@ -213,7 +261,7 @@ func handleSyncStart() http.HandlerFunc {
 				logError("saving reconciled session: %v", err)
 			}
 
-			var files []fileInfo
+			files := make([]fileInfo, 0, len(sess.Files))
 			for _, fs := range sess.Files {
 				files = append(files, fileInfo{
 					Path:   fs.Path,
@@ -238,7 +286,7 @@ func handleSyncStart() http.HandlerFunc {
 		// Fresh session. The session covers the delta, plus ambiguous files
 		// (size+mtime match) whose SHA-256 the server computes so the client
 		// can verify its local copy without re-transferring.
-		filePaths, files, err := buildSessionFiles(sourceManifest, req.DestinationManifest, profile, delta)
+		filePaths, files, err := buildSessionFiles(sourceManifest, req.DestinationManifest, profile, delta, baseline != nil)
 		if err != nil {
 			logError("building session files: %v", err)
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to prepare session"})
@@ -246,6 +294,12 @@ func handleSyncStart() http.HandlerFunc {
 		}
 
 		sess = transfer.NewSession(req.DeviceID, req.Profile, filePaths)
+		srcByPath := manifestIndex(sourceManifest)
+		for _, p := range filePaths {
+			if f, ok := srcByPath[p]; ok {
+				sess.SetFileMeta(p, f.Size, f.ModTime)
+			}
+		}
 		if err := sess.Save(); err != nil {
 			logError("saving session: %v", err)
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to save session"})
@@ -267,25 +321,40 @@ func handleSyncStart() http.HandlerFunc {
 // buildSessionFiles returns the list of session file paths and the response
 // file info for a fresh session: delta files (adds/updates) plus ambiguous
 // files that need hash verification against the client's local copy.
-func buildSessionFiles(sourceManifest diff.Manifest, dstManifest diff.Manifest, profile *config.Profile, delta diff.Delta) ([]string, []fileInfo, error) {
+func buildSessionFiles(sourceManifest diff.Manifest, dstManifest diff.Manifest, profile *config.Profile, delta diff.Delta, trustBaseline bool) ([]string, []fileInfo, error) {
 	var filePaths []string
-	var files []fileInfo
+	files := make([]fileInfo, 0)
+	srcIndex := manifestIndex(sourceManifest)
 	seen := make(map[string]bool, len(delta.ToAdd)+len(delta.ToUpdate))
 
+	add := func(path string) {
+		if seen[path] {
+			return
+		}
+		seen[path] = true
+		filePaths = append(filePaths, path)
+		if f, ok := srcIndex[path]; ok {
+			files = append(files, fileInfo{Path: path, Size: f.Size})
+		}
+	}
 	for _, a := range delta.ToAdd {
-		filePaths = append(filePaths, a.Path)
-		seen[a.Path] = true
+		add(a.Path)
 	}
 	for _, a := range delta.ToUpdate {
-		filePaths = append(filePaths, a.Path)
-		seen[a.Path] = true
+		add(a.Path)
+	}
+
+	// With a baseline, unchanged files were already cross-checked against the
+	// destination by ComputeDeltaWithBase. Re-hashing them on every sync would
+	// defeat the point of the baseline.
+	if trustBaseline {
+		return filePaths, files, nil
 	}
 
 	dstIndex := manifestIndex(dstManifest)
 
 	for _, f := range sourceManifest.Files {
 		if seen[f.Path] {
-			files = append(files, fileInfo{Path: f.Path, Size: f.Size})
 			continue
 		}
 		dst, ok := dstIndex[f.Path]
@@ -299,6 +368,7 @@ func buildSessionFiles(sourceManifest diff.Manifest, dstManifest diff.Manifest, 
 			logError("hashing ambiguous file %s: %v", f.Path, err)
 			continue
 		}
+		seen[f.Path] = true
 		filePaths = append(filePaths, f.Path)
 		files = append(files, fileInfo{Path: f.Path, Size: f.Size, SHA256: hash})
 	}
@@ -398,6 +468,11 @@ func handleSyncFile() http.HandlerFunc {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to hash file"})
 			return
 		}
+
+		// Record the metadata of the exact version being served so a later
+		// resume can distinguish "source changed" from "recipient rewrote the
+		// file with its own mtime".
+		sess.SetFileMeta(filePath, info.Size(), info.ModTime().Truncate(time.Second).Unix())
 
 		// File is verified readable and hashable — only now is the transfer
 		// state marked in_progress.
@@ -591,6 +666,11 @@ func handleSyncComplete() http.HandlerFunc {
 			return
 		}
 
+		// Persist what this device now has before dropping the session. This
+		// is the baseline future deltas compare against, so recipient mtimes
+		// (which Android cannot preserve) never matter.
+		savePullCompletionState(sess)
+
 		// Delete the resolved path, not the client-supplied identifier: a
 		// client may send only the basename.
 		if err := transfer.DeleteSession(sess.Path); err != nil {
@@ -601,6 +681,40 @@ func handleSyncComplete() http.HandlerFunc {
 
 		logInfo("sync complete: session=%s", req.Session)
 		writeJSON(w, http.StatusOK, syncCompleteResponse{OK: true})
+	}
+}
+
+// savePullCompletionState records the last-synced baseline for a completed
+// pull session. Files the session delivered use the metadata recorded when
+// they were served; files already current keep their previous baseline entry.
+func savePullCompletionState(sess *transfer.Session) {
+	prev, err := transfer.LoadState(sess.DeviceID, sess.Profile)
+	if err != nil {
+		logError("loading previous sync state: %v", err)
+	}
+
+	var sourcePaths map[string]bool
+	if profile := findProfile(getConfig(), sess.Profile); profile != nil {
+		if m, err := diff.BuildManifest(profile.Source); err == nil {
+			sourcePaths = make(map[string]bool, len(m.Files))
+			for _, f := range m.Files {
+				sourcePaths[f.Path] = true
+			}
+		} else {
+			logError("building source manifest for sync state: %v", err)
+		}
+	}
+
+	state := transfer.BuildCompletionState(
+		sess.DeviceID,
+		sess.Profile,
+		config.DirectionPull,
+		prev,
+		sess.Files,
+		sourcePaths,
+	)
+	if err := transfer.SaveState(state); err != nil {
+		logError("saving sync state: %v", err)
 	}
 }
 

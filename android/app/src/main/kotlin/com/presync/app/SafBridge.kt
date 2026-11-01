@@ -4,6 +4,7 @@ import android.app.Activity
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
+import android.view.WindowManager
 import android.webkit.JavascriptInterface
 import android.webkit.WebView
 import androidx.documentfile.provider.DocumentFile
@@ -25,12 +26,21 @@ class SafBridge(
     @Volatile
     private var pendingPushProfile: String? = null
 
+    // The bridge runs on the WebView's JavaBridge thread, where WebView methods
+    // must never be called. MainActivity keeps this in sync from the UI thread.
+    @Volatile
+    private var currentUrl: String? = null
+
+    fun updateCurrentUrl(url: String?) {
+        currentUrl = url
+    }
+
     // Only pages loaded from the paired server's origin may use the bridge.
     // Navigation is additionally blocked cross-origin in MainActivity, so this
     // is defense in depth against a malicious or redirected page.
     private fun isTrustedPage(): Boolean {
         val origin = trustedOrigin ?: return false
-        val url = webView.url ?: return false
+        val url = currentUrl ?: return false
         return url.startsWith(origin)
     }
 
@@ -62,6 +72,20 @@ class SafBridge(
     fun getDeviceId(): String {
         if (!isTrustedPage()) return ""
         return prefs.getString("device_id", "") ?: ""
+    }
+
+    // Keeps the display awake while a sync runs so WebView timers and network
+    // requests are not suspended by the screen timeout.
+    @JavascriptInterface
+    fun setSyncActive(active: Boolean) {
+        if (!isTrustedPage()) return
+        activity.runOnUiThread {
+            if (active) {
+                activity.window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            } else {
+                activity.window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            }
+        }
     }
 
     // --- Destination file access (pull) ---
@@ -671,7 +695,9 @@ class SafBridge(
             put("data", data)
         }
         val script = "javascript:$functionName($json)"
-        webView.evaluateJavascript(script, null)
+        activity.runOnUiThread {
+            webView.evaluateJavascript(script, null)
+        }
     }
 
     companion object {

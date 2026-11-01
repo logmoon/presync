@@ -2,6 +2,7 @@ package com.presync.app
 
 import android.annotation.SuppressLint
 import android.content.Intent
+import android.graphics.Bitmap
 import android.graphics.Color
 import android.net.Uri
 import android.os.Bundle
@@ -160,6 +161,7 @@ class MainActivity : AppCompatActivity() {
 
         trustedOrigin = originOf(url)
         safBridge = SafBridge(this, webView, trustedOrigin)
+        safBridge.updateCurrentUrl(url)
 
         webView.settings.apply {
             javaScriptEnabled = true
@@ -171,6 +173,14 @@ class MainActivity : AppCompatActivity() {
         webView.addJavascriptInterface(safBridge, "AndroidBridge")
 
         webView.webViewClient = object : WebViewClient() {
+            override fun onPageStarted(view: WebView, pageUrl: String, favicon: Bitmap?) {
+                safBridge.updateCurrentUrl(pageUrl)
+            }
+
+            override fun doUpdateVisitedHistory(view: WebView, pageUrl: String, isReload: Boolean) {
+                safBridge.updateCurrentUrl(pageUrl)
+            }
+
             override fun shouldOverrideUrlLoading(view: WebView, request: android.webkit.WebResourceRequest): Boolean {
                 val origin = trustedOrigin
                 if (origin != null && !request.url.toString().startsWith(origin)) {
@@ -187,9 +197,9 @@ class MainActivity : AppCompatActivity() {
                 if (request.isForMainFrame) {
                     // Transient load error — do NOT wipe pairing data. Show the
                     // retry screen instead.
-                    val url = getServerUrl()
-                    if (url != null) {
-                        showRetryScreen(url)
+                    val serverUrl = getServerUrl()
+                    if (serverUrl != null) {
+                        showRetryScreen(serverUrl)
                     }
                 }
             }

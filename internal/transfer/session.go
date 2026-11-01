@@ -34,19 +34,26 @@ type FileSession struct {
 	Offset   int64     `json:"offset"`
 	Attempts int       `json:"attempts"`
 	SHA256   string    `json:"sha256,omitempty"`
-	// Size is the expected source size for push transfers. Zero for pull.
-	Size int64 `json:"size,omitempty"`
+	// Size and ModTime describe the source file this session entry was created
+	// from. They let a resume tell "source changed" from "recipient cannot
+	// preserve mtimes" (Android SAF writes a fresh mtime).
+	Size    int64 `json:"size,omitempty"`
+	ModTime int64 `json:"mod_time,omitempty"`
 }
 
 type Session struct {
-	DeviceID    string        `json:"device_id"`
-	Profile     string        `json:"profile"`
-	Direction   string        `json:"direction"`
-	Files       []FileSession `json:"files"`
-	ToDelete    []string      `json:"to_delete,omitempty"`
-	CreatedAt   time.Time     `json:"created_at"`
-	LastUpdated time.Time     `json:"last_updated"`
-	Path        string        `json:"-"`
+	DeviceID  string        `json:"device_id"`
+	Profile   string        `json:"profile"`
+	Direction string        `json:"direction"`
+	Files     []FileSession `json:"files"`
+	// SourceFiles is the client-reported source manifest for push sessions. It
+	// lets the server persist a last-synced baseline at completion without
+	// needing a second manifest from the client.
+	SourceFiles []StateFile `json:"source_files"`
+	ToDelete    []string    `json:"to_delete,omitempty"`
+	CreatedAt   time.Time   `json:"created_at"`
+	LastUpdated time.Time   `json:"last_updated"`
+	Path        string      `json:"-"`
 	mu          sync.Mutex
 }
 
@@ -55,6 +62,7 @@ type sessionFile struct {
 	Profile     string        `json:"profile"`
 	Direction   string        `json:"direction,omitempty"`
 	Files       []FileSession `json:"files"`
+	SourceFiles []StateFile   `json:"source_files"`
 	ToDelete    []string      `json:"to_delete,omitempty"`
 	CreatedAt   time.Time     `json:"created_at"`
 	LastUpdated time.Time     `json:"last_updated"`
@@ -135,6 +143,7 @@ func LoadSession(path string) (*Session, error) {
 		Profile:     sf.Profile,
 		Direction:   direction,
 		Files:       sf.Files,
+		SourceFiles: sf.SourceFiles,
 		ToDelete:    sf.ToDelete,
 		CreatedAt:   sf.CreatedAt,
 		LastUpdated: sf.LastUpdated,
@@ -153,6 +162,7 @@ func (s *Session) Save() error {
 		Profile:     s.Profile,
 		Direction:   s.Direction,
 		Files:       s.Files,
+		SourceFiles: s.SourceFiles,
 		ToDelete:    s.ToDelete,
 		CreatedAt:   s.CreatedAt,
 		LastUpdated: s.LastUpdated,
@@ -244,8 +254,9 @@ func (s *Session) RemoveFile(path string) {
 
 // UpsertFile marks a file that the current delta says must be uploaded. It adds
 // the file when missing, and resets any prior state (including a stale done
-// entry whose destination was removed or changed) so the upload happens again.
-func (s *Session) UpsertFile(path string, size int64) {
+// entry whose source changed or whose destination was removed) so the upload
+// happens again.
+func (s *Session) UpsertFile(path string, size, modTime int64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -258,14 +269,50 @@ func (s *Session) UpsertFile(path string, size int64) {
 		s.Files[i].Attempts = 0
 		s.Files[i].SHA256 = ""
 		s.Files[i].Size = size
+		s.Files[i].ModTime = modTime
 		return
 	}
 
 	s.Files = append(s.Files, FileSession{
-		Path:  path,
-		State: FilePending,
-		Size:  size,
+		Path:    path,
+		State:   FilePending,
+		Size:    size,
+		ModTime: modTime,
 	})
+}
+
+// SetFileMeta records the source metadata for an existing file entry without
+// disturbing its state, offset, or hash.
+func (s *Session) SetFileMeta(path string, size, modTime int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for i := range s.Files {
+		if s.Files[i].Path == path {
+			s.Files[i].Size = size
+			s.Files[i].ModTime = modTime
+			return
+		}
+	}
+}
+
+// SetSourceFiles replaces the client-reported source manifest snapshot (push).
+func (s *Session) SetSourceFiles(files []StateFile) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.SourceFiles = files
+}
+
+// SourceFileSnapshot returns a copy of the stored push source snapshot.
+func (s *Session) SourceFileSnapshot() []StateFile {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.SourceFiles == nil {
+		return nil
+	}
+	result := make([]StateFile, len(s.SourceFiles))
+	copy(result, s.SourceFiles)
+	return result
 }
 
 func (s *Session) SetFileSize(path string, size int64) {

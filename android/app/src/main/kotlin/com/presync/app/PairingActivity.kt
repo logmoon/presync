@@ -29,10 +29,12 @@ import com.google.mlkit.vision.barcode.common.Barcode
 import com.google.mlkit.vision.common.InputImage
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
 
 class PairingActivity : AppCompatActivity() {
 
     private lateinit var cameraExecutor: ExecutorService
+    private val pairingLaunched = AtomicBoolean(false)
     private val barcodeScanner by lazy {
         BarcodeScanning.getClient(
             BarcodeScannerOptions.Builder()
@@ -222,7 +224,9 @@ class PairingActivity : AppCompatActivity() {
                                     for (barcode in barcodes) {
                                         val raw = barcode.rawValue ?: continue
                                         if (isValidPairingUrl(raw)) {
-                                            runOnUiThread { proceedWithUrl(raw) }
+                                            if (pairingLaunched.compareAndSet(false, true)) {
+                                                runOnUiThread { proceedWithUrl(raw) }
+                                            }
                                             return@addOnSuccessListener
                                         }
                                     }

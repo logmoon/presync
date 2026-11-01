@@ -209,12 +209,26 @@ else
 fi
 
 echo ""
-echo "=== Test 6: Resume after daemon restart ==="
+echo "=== Test 6: Delta after a completed sync (baseline) ==="
 # Modify a file to test re-sync
 echo "updated content" > "$SRC_DIR/file1.txt"
 
 # Start a new sync
-DEST_MANIFEST='{"root":"'"$DST_DIR"'","files":[{"path":"file1.txt","size":16,"mod_time":0},{"path":"bigfile.bin","size":262144,"mod_time":0},{"path":"subdir/nested.txt","size":16,"mod_time":0},{"path":"subdir/medium.bin","size":65536,"mod_time":0}],"built_at":0}'
+DEST_MANIFEST=$(python3 - "$DST_DIR" <<'PYEOF'
+import json, os, sys
+root = sys.argv[1]
+files = []
+for dirpath, _, names in os.walk(root):
+    for n in names:
+        full = os.path.join(dirpath, n)
+        files.append({
+            "path": os.path.relpath(full, root),
+            "size": os.path.getsize(full),
+            "mod_time": 0,
+        })
+print(json.dumps({"root": root, "files": files, "built_at": 0}))
+PYEOF
+)
 SYNC_RESP2=$(curl -s -X POST $BASE/sync \
   -H "Content-Type: application/json" \
   -H "X-Presync-Token: $LONG_TOKEN" \
@@ -228,7 +242,8 @@ for f in data['files']:
 ")
 FILE_COUNT2=$(echo "$SYNC_RESP2" | python3 -c "import sys,json; print(len(json.load(sys.stdin)['files']))")
 
-assert_eq "resync has files to update" "4" "$FILE_COUNT2"
+assert_eq "resync only queues the changed file" "1" "$FILE_COUNT2"
+assert_contains "resync file is file1.txt" "file1.txt" "$FILES2"
 
 # Fetch and confirm only file1.txt (simulate partial transfer)
 for FILE_PATH in $FILES2; do
@@ -250,6 +265,39 @@ for FILE_PATH in $FILES2; do
 done
 
 assert_files_equal "file1.txt updated after resync" "$SRC_DIR/file1.txt" "$DST_DIR/file1.txt"
+
+# Complete this partial session so the baseline records the new file1.txt.
+SESSION2=$(echo "$SYNC_RESP2" | python3 -c "import sys,json; print(json.load(sys.stdin)['session'])")
+COMPLETE2=$(curl -s -X POST $BASE/sync/complete \
+  -H "Content-Type: application/json" \
+  -H "X-Presync-Token: $LONG_TOKEN" \
+  -d '{"session":"'"$SESSION2"'"}')
+COMPLETE2_OK=$(echo "$COMPLETE2" | python3 -c "import sys,json; print(json.load(sys.stdin)['ok'])")
+assert_eq "partial session completes" "True" "$COMPLETE2_OK"
+
+echo ""
+echo "=== Test 6b: Unchanged second sync transfers nothing ==="
+DEST_MANIFEST=$(python3 - "$DST_DIR" <<'PYEOF'
+import json, os, sys
+root = sys.argv[1]
+files = []
+for dirpath, _, names in os.walk(root):
+    for n in names:
+        full = os.path.join(dirpath, n)
+        files.append({
+            "path": os.path.relpath(full, root),
+            "size": os.path.getsize(full),
+            "mod_time": 0,
+        })
+print(json.dumps({"root": root, "files": files, "built_at": 0}))
+PYEOF
+)
+SYNC_RESP_AGAIN=$(curl -s -X POST $BASE/sync \
+  -H "Content-Type: application/json" \
+  -H "X-Presync-Token: $LONG_TOKEN" \
+  -d '{"device_id":"'"$DEVICE_ID"'","profile":"Music","destination_manifest":'"$DEST_MANIFEST"'}')
+FILE_COUNT_AGAIN=$(echo "$SYNC_RESP_AGAIN" | python3 -c "import sys,json; print(len(json.load(sys.stdin)['files']))")
+assert_eq "unchanged second sync has no files" "0" "$FILE_COUNT_AGAIN"
 
 echo ""
 echo "=== Test 7: Checksum mismatch triggers retry ==="

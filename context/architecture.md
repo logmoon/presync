@@ -92,7 +92,9 @@ Client → connect.go sends stored token to server
 Server → trust.go validates token
 Server → profiles.go loads profile config → diff.go builds source manifest
 Client → apply.go builds destination manifest, sends to server
-Server → diff.go computes delta (add / update / delete)
+Server → diff.go computes delta against the per-device last-synced baseline,
+         using the destination manifest only to catch missing/size-changed
+         files (recipient mtimes are never used), plus mirror deletions
 Server → transfer.go streams each file in chunks, computing SHA-256 as it sends
 Client → apply.go writes to <file>.presync-tmp, computes SHA-256 on completion
 Client → reports hash back to server
@@ -108,9 +110,10 @@ Session file deleted once every file reaches 'done'
 Client → reconnects, sends stored token
 Server → trust.go validates token
 Server → session.go checks for existing session file for this device + profile
-  found → reconcile the session with the freshly computed delta: done files that
-          the destination no longer matches are re-queued, new source files are
-          added, and files removed from the source are dropped
+  found → reconcile against the source: done files stay done when the source
+          metadata is unchanged and the recipient still has them at the right
+          size; source-changed or destination-missing files are re-queued; new
+          source files are added and files removed from the source are dropped
         → for the 'in_progress'/re-queued files, the client resumes from its temp
           file's byte count
         → remaining 'pending' files proceed normally
@@ -143,7 +146,8 @@ None. State is stored as flat files, owned exclusively by `internal/config`:
 
 - `config.toml` — profiles and daemon settings (see Config below)
 - `devices.json` — paired device identities + long-lived tokens
-- `sessions/<device-id>-<profile>-<timestamp>.json` — per-file sync state (`pending` / `in_progress` / `done`), the profile `direction`, the expected file `size` for push uploads, and (mirror push only) the planned `to_delete` list
+- `sessions/<device-id>-<profile>-<timestamp>.json` — per-file sync state (`pending` / `in_progress` / `done`), the profile `direction`, the source `size`/`mod_time` each entry was created from, and (mirror push only) the planned `to_delete` list
+- `state/<device-id>-<profile>.json` — last-synced baseline per device+profile: path, size, mod_time, SHA-256 of what the recipient actually received. Written on completion, used for every later delta, deleted on unpair.
 
 ## Authentication
 
@@ -167,6 +171,7 @@ None. State is stored as flat files, owned exclusively by `internal/config`:
 8. `internal/diff` performs zero network or disk I/O — it is pure computation over two manifests in, a delta out, and must stay unit-testable without mocks.
 9. A sync must be resumable purely by reading the session JSON plus checking the in-progress temp file's byte count — no other hidden in-memory state is allowed to be required for resume correctness.
 10. No Phase 1 or Phase 2 code path hardcodes or assumes an `https://` scheme; transport is plain HTTP by design until Phase 3.
-11. `internal/config` is the only package permitted to read or write `config.toml`, `devices.json`, `servers.json`, and `local-token` directly; `internal/transfer` owns all session-file CRUD (via `config.SessionsDir()`). All other packages go through these two.
+11. `internal/config` is the only package permitted to read or write `config.toml`, `devices.json`, `servers.json`, and `local-token` directly; `internal/transfer` owns all session-file and baseline-state CRUD (via `config.SessionsDir()` and `config.StateDir()`). All other packages go through these two.
 12. Stale session files older than 7 days are pruned on server start, and `presync sync --fresh` must always be honored as "ignore any existing session, start clean" regardless of session age. The `fresh` flag is also honored server-side for remote clients. Incomplete sessions are considered stale (and resumable state discarded) after 30 minutes of inactivity.
 13. A mirror push never deletes anything when the client reports an empty source manifest while the destination contains files, and never before every upload in that session has been hash-verified and the session completed.
+14. Deltas for a device+profile are computed against that device's last-synced baseline, never against recipient mtimes — Android SAF cannot preserve them, so mtime comparison would re-transfer the whole library on every run. The recipient manifest is used only for presence/size checks and mirror deletions. `presync sync --fresh` discards the session but keeps the baseline; unpair deletes it.

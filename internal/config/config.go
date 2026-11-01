@@ -17,6 +17,7 @@ const (
 	pidFileName     = "presync.pid"
 	logDirName      = "logs"
 	logFileName     = "presync.log"
+	stateDirName    = "state"
 
 	DirectionPull = "pull"
 	DirectionPush = "push"
@@ -75,12 +76,19 @@ func LogDir() string {
 	return filepath.Join(ConfigDir(), logDirName)
 }
 
+// StateDir holds the per-device last-synced baseline files. The server uses
+// them to compute deltas without relying on recipient mtimes (Android SAF
+// cannot preserve them). Owned by internal/transfer.
+func StateDir() string {
+	return filepath.Join(ConfigDir(), stateDirName)
+}
+
 func LogPath() string {
 	return filepath.Join(LogDir(), logFileName)
 }
 
 func EnsureDirs() error {
-	dirs := []string{ConfigDir(), LogDir(), SessionsDir()}
+	dirs := []string{ConfigDir(), LogDir(), SessionsDir(), StateDir()}
 	for _, d := range dirs {
 		if err := os.MkdirAll(d, 0o755); err != nil {
 			return fmt.Errorf("creating directory %s: %w", d, err)

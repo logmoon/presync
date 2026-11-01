@@ -400,6 +400,104 @@ func TestEndToEnd_BuildAndDiff(t *testing.T) {
 	}
 }
 
+func TestComputeDeltaWithBase_UnchangedSourceIgnoresDestinationMTime(t *testing.T) {
+	src := Manifest{Files: []FileEntry{{Path: "a.txt", Size: 100, ModTime: 1000}}}
+	base := Manifest{Files: []FileEntry{{Path: "a.txt", Size: 100, ModTime: 1000}}}
+	// Android SAF cannot preserve mtimes: the recipient's copy was written now.
+	dst := Manifest{Files: []FileEntry{{Path: "a.txt", Size: 100, ModTime: 9999}}}
+
+	delta := ComputeDeltaWithBase(src, dst, base, "mirror")
+
+	if len(delta.ToAdd) != 0 || len(delta.ToUpdate) != 0 || len(delta.ToDelete) != 0 {
+		t.Errorf("expected unchanged file to be skipped, got add=%d update=%d delete=%d",
+			len(delta.ToAdd), len(delta.ToUpdate), len(delta.ToDelete))
+	}
+}
+
+func TestComputeDeltaWithBase_NewFileIsAdded(t *testing.T) {
+	src := Manifest{Files: []FileEntry{
+		{Path: "a.txt", Size: 100, ModTime: 1000},
+		{Path: "new.txt", Size: 50, ModTime: 2000},
+	}}
+	base := Manifest{Files: []FileEntry{{Path: "a.txt", Size: 100, ModTime: 1000}}}
+	dst := Manifest{Files: []FileEntry{{Path: "a.txt", Size: 100, ModTime: 9999}}}
+
+	delta := ComputeDeltaWithBase(src, dst, base, "mirror")
+
+	if len(delta.ToAdd) != 1 || delta.ToAdd[0].Path != "new.txt" {
+		t.Fatalf("expected add [new.txt], got %v", delta.ToAdd)
+	}
+	if len(delta.ToUpdate) != 0 {
+		t.Errorf("expected no updates, got %v", delta.ToUpdate)
+	}
+}
+
+func TestComputeDeltaWithBase_SourceChangedIsUpdated(t *testing.T) {
+	src := Manifest{Files: []FileEntry{{Path: "a.txt", Size: 101, ModTime: 1001}}}
+	base := Manifest{Files: []FileEntry{{Path: "a.txt", Size: 100, ModTime: 1000}}}
+	dst := Manifest{Files: []FileEntry{{Path: "a.txt", Size: 100, ModTime: 9999}}}
+
+	delta := ComputeDeltaWithBase(src, dst, base, "mirror")
+
+	if len(delta.ToUpdate) != 1 || delta.ToUpdate[0].Path != "a.txt" {
+		t.Fatalf("expected update [a.txt], got %v", delta.ToUpdate)
+	}
+}
+
+func TestComputeDeltaWithBase_MissingAtDestinationIsUpdated(t *testing.T) {
+	src := Manifest{Files: []FileEntry{{Path: "a.txt", Size: 100, ModTime: 1000}}}
+	base := Manifest{Files: []FileEntry{{Path: "a.txt", Size: 100, ModTime: 1000}}}
+	dst := Manifest{}
+
+	delta := ComputeDeltaWithBase(src, dst, base, "mirror")
+
+	if len(delta.ToUpdate) != 1 || delta.ToUpdate[0].Path != "a.txt" {
+		t.Fatalf("expected update [a.txt], got %v", delta.ToUpdate)
+	}
+}
+
+func TestComputeDeltaWithBase_SizeMismatchAtDestinationIsUpdated(t *testing.T) {
+	src := Manifest{Files: []FileEntry{{Path: "a.txt", Size: 100, ModTime: 1000}}}
+	base := Manifest{Files: []FileEntry{{Path: "a.txt", Size: 100, ModTime: 1000}}}
+	dst := Manifest{Files: []FileEntry{{Path: "a.txt", Size: 42, ModTime: 1000}}}
+
+	delta := ComputeDeltaWithBase(src, dst, base, "mirror")
+
+	if len(delta.ToUpdate) != 1 || delta.ToUpdate[0].Path != "a.txt" {
+		t.Fatalf("expected update [a.txt], got %v", delta.ToUpdate)
+	}
+}
+
+func TestComputeDeltaWithBase_MirrorDeletes(t *testing.T) {
+	src := Manifest{Files: []FileEntry{{Path: "a.txt", Size: 100, ModTime: 1000}}}
+	base := Manifest{Files: []FileEntry{{Path: "a.txt", Size: 100, ModTime: 1000}}}
+	dst := Manifest{Files: []FileEntry{
+		{Path: "a.txt", Size: 100, ModTime: 9999},
+		{Path: "gone.txt", Size: 10, ModTime: 9999},
+	}}
+
+	delta := ComputeDeltaWithBase(src, dst, base, "mirror")
+
+	if len(delta.ToDelete) != 1 || delta.ToDelete[0].Path != "gone.txt" {
+		t.Fatalf("expected delete [gone.txt], got %v", delta.ToDelete)
+	}
+}
+
+func TestComputeDeltaWithBase_AdditiveNeverDeletes(t *testing.T) {
+	src := Manifest{Files: []FileEntry{{Path: "a.txt", Size: 100, ModTime: 1000}}}
+	base := Manifest{Files: []FileEntry{{Path: "a.txt", Size: 100, ModTime: 1000}}}
+	dst := Manifest{Files: []FileEntry{
+		{Path: "a.txt", Size: 100, ModTime: 9999},
+		{Path: "gone.txt", Size: 10, ModTime: 9999},
+	}}
+
+	delta := ComputeDeltaWithBase(src, dst, base, "additive")
+
+	if len(delta.ToDelete) != 0 {
+		t.Errorf("expected no deletes in additive mode, got %v", delta.ToDelete)
+	}
+}
+
 func writeFile(t *testing.T, dir, relPath string, content []byte) {
 	t.Helper()
 	full := filepath.Join(dir, relPath)

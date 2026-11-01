@@ -2,7 +2,7 @@
 
 ## Active Feature
 
-Android pull restored + push profiles (client → server) built and ready for device testing.
+Manual end-to-end verification of the Android pull/push client after the pairing-bridge, resumable-baseline, and progress/Resume UI fixes.
 
 Branch: main
 
@@ -12,19 +12,19 @@ closing
 
 ## Next Action
 
-Give the developer the manual end-to-end test tutorial: clean config, start daemon, pair the Android app, pull a small folder then `~/Music`, push a small folder, test resume by restarting the daemon mid-transfer, and test mirror deletion. Use `./presync` and `android/app/build/outputs/apk/debug/app-debug.apk`; fix issues found.
+Resume the `music` pull on the phone (it is running/paused around 151+/1235; session `8bc052af7b3ebe88-music-20261101T181657...`). Then finish the manual tests: push (pick a phone source folder via SAF, send, repeat-send, stop/resume, mirror delete), `small` pull (baseline, drop/resume with a big file, mirror delete), additive check with `~/Music/zz-presync-additive.txt`, and a second Sync Now per profile asserting zero transfers.
 
 ## Decisions & Problems Not Yet Elsewhere
 
-- JS→Android bridge callbacks must be global names, not inline functions. `web/app.js` uses `bridgeCallback()` and passes the generated name; keep this for any new bridge method.
-- Pull resume reconciles the session against the freshly computed delta: changed/missing `done` files are re-queued, new source files are added, removed source files are dropped.
-- Push uses server-owned offsets and temp files; mirror deletions are persisted and applied only on successful `/push/complete`; an empty source manifest is refused when the destination has files.
-- Complete handlers delete the resolved `sess.Path`, never the raw client-supplied session identifier.
-- Manifest paths are normalized to forward slashes (`filepath.ToSlash`) so Windows/Android manifests compare correctly.
-- Android SAF append/seek/rename are still device-unverified.
+- The old music session went stale (>30 min) and was discarded; the current session started fresh, so ~83 files already on the phone re-transfer once. Expected.
+- Phone destination is `Sync/Music`; pull paths are `Sync/Music/<profile>/...`. Push destination on the PC is `~/presync-test/push-recv`.
+- Home now shows `Syncing…`/`Sending…` disabled while a local sync runs, `Resume sync`/`Resume upload` for paused sessions, and disables all sync/push actions during a run.
+- Pairing bridge fix: never read `webView.url` off the UI thread; SafBridge uses a `@Volatile currentUrl` kept in sync by MainActivity.
+- Review findings fixed: legacy sessions hash-verify before seeding metadata; empty push sources reconcile the baseline; completed/stale sessions are reaped with a grace window; server-driven cards say “in progress”.
+- Verified on-device: pairing, music pull progress, keep-screen-awake, Stop → paused card with Resume, Home disabled/Syncing state, Resumed twice successfully.
 
 ## Open Questions
 
-- Does SAF `openOutputStream(uri, "wa")` and `DocumentFile.renameTo` behave correctly on the Samsung A06? The device test will tell.
-- Real music is ~6.8G against ~12G free on the phone — full pull is feasible but tight.
-- Still pending after this: Task 12 auto-sync, mDNS, sync history, cross-compile.
+- Does the full 6.8G music pull complete cleanly with the new baseline?
+- Push SAF folder picking, stop/resume of a large upload, and mirror delete are still untested on-device.
+- The keep-screen-on flag after a WebView reload mid-sync (native lifecycle does not clear it) is unverified; PairingActivity’s one-shot guard is fine as long as proceedWithUrl always navigates.

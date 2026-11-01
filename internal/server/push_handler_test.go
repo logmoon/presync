@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"testing"
+	"time"
 
 	"presync/internal/config"
 	"presync/internal/diff"
@@ -510,5 +511,162 @@ func TestResolvePushPathRejectsUnsafeInputs(t *testing.T) {
 
 	if _, err := resolvePushPath(root, "sub/a.mp3"); err != nil {
 		t.Errorf("expected safe path to resolve: %v", err)
+	}
+}
+
+func TestHandlePushStart_ResumeIgnoresDestinationMTime(t *testing.T) {
+	destDir, srcDir := setupPushHandlerTest(t, "additive", nil, map[string]string{
+		"a.txt": "hello",
+		"b.txt": "world",
+	})
+
+	srcManifest, err := diff.BuildManifest(srcDir)
+	if err != nil {
+		t.Fatalf("building source manifest: %v", err)
+	}
+	srcIndex := manifestIndex(srcManifest)
+	a, b := srcIndex["a.txt"], srcIndex["b.txt"]
+
+	first := pushStart(t, srcDir)
+	sess, err := transfer.LoadSession(first.Session)
+	if err != nil {
+		t.Fatalf("loading session: %v", err)
+	}
+
+	// Simulate a completed upload of a.txt: the server-side file exists with a
+	// receive-time mtime, and the session records it as done.
+	if err := os.WriteFile(filepath.Join(destDir, "a.txt"), []byte("hello"), 0o644); err != nil {
+		t.Fatalf("writing destination file: %v", err)
+	}
+	destTime := time.Unix(a.ModTime+5000, 0)
+	if err := os.Chtimes(filepath.Join(destDir, "a.txt"), destTime, destTime); err != nil {
+		t.Fatalf("setting destination mtime: %v", err)
+	}
+	hash, err := transfer.ComputeFileHash(filepath.Join(srcDir, "a.txt"))
+	if err != nil {
+		t.Fatalf("hashing source: %v", err)
+	}
+	sess.SetFileMeta("a.txt", a.Size, a.ModTime)
+	sess.SetFileMeta("b.txt", b.Size, b.ModTime)
+	sess.MarkDone("a.txt", hash)
+	if err := sess.Save(); err != nil {
+		t.Fatalf("saving session: %v", err)
+	}
+
+	second := pushStart(t, srcDir)
+	states := make(map[string]string, len(second.Files))
+	for _, f := range second.Files {
+		states[f.Path] = f.State
+	}
+	if states["a.txt"] != string(transfer.FileDone) {
+		t.Errorf("done upload was re-queued because of the destination mtime: %q", states["a.txt"])
+	}
+	if states["b.txt"] != string(transfer.FilePending) {
+		t.Errorf("expected b.txt pending, got %q", states["b.txt"])
+	}
+}
+
+func TestHandlePushStart_SecondPushAfterCompleteUploadsNothing(t *testing.T) {
+	destDir, srcDir := setupPushHandlerTest(t, "additive", nil, map[string]string{
+		"a.txt": "hello",
+		"b.txt": "world",
+	})
+
+	srcManifest, err := diff.BuildManifest(srcDir)
+	if err != nil {
+		t.Fatalf("building source manifest: %v", err)
+	}
+
+	// Server already holds both files at receive-time mtimes.
+	for _, f := range srcManifest.Files {
+		content, err := os.ReadFile(filepath.Join(srcDir, f.Path))
+		if err != nil {
+			t.Fatalf("reading source %s: %v", f.Path, err)
+		}
+		destPath := filepath.Join(destDir, f.Path)
+		if err := os.WriteFile(destPath, content, 0o644); err != nil {
+			t.Fatalf("writing destination %s: %v", f.Path, err)
+		}
+		destTime := time.Unix(f.ModTime+5000, 0)
+		if err := os.Chtimes(destPath, destTime, destTime); err != nil {
+			t.Fatalf("setting destination mtime: %v", err)
+		}
+	}
+
+	paths := make([]string, 0, len(srcManifest.Files))
+	for _, f := range srcManifest.Files {
+		paths = append(paths, f.Path)
+	}
+	sess := transfer.NewSessionWithDirection("phone1", "PhoneMusic", config.DirectionPush, paths)
+	sess.SetSourceFiles(transfer.StateFilesFromManifest(srcManifest))
+	for _, f := range srcManifest.Files {
+		hash, err := transfer.ComputeFileHash(filepath.Join(srcDir, f.Path))
+		if err != nil {
+			t.Fatalf("hashing %s: %v", f.Path, err)
+		}
+		sess.SetFileMeta(f.Path, f.Size, f.ModTime)
+		sess.MarkDone(f.Path, hash)
+	}
+	if err := sess.Save(); err != nil {
+		t.Fatalf("saving session: %v", err)
+	}
+
+	completeBody, _ := json.Marshal(map[string]string{"session": sess.Path})
+	completeReq := httptest.NewRequest(http.MethodPost, "/push/complete", bytes.NewReader(completeBody))
+	completeW := httptest.NewRecorder()
+	handlePushComplete()(completeW, completeReq)
+	if completeW.Code != http.StatusOK {
+		t.Fatalf("complete returned %d: %s", completeW.Code, completeW.Body.String())
+	}
+
+	state, err := transfer.LoadState("phone1", "PhoneMusic")
+	if err != nil {
+		t.Fatalf("loading state: %v", err)
+	}
+	if state == nil || len(state.Files) != 2 {
+		t.Fatalf("expected 2 baseline entries, got %+v", state)
+	}
+
+	second := pushStart(t, srcDir)
+	if len(second.Files) != 0 {
+		t.Errorf("expected no uploads on an unchanged second push, got %+v", second.Files)
+	}
+}
+
+func TestHandlePushComplete_EmptySourceClearsBaseline(t *testing.T) {
+	_, _ = setupPushHandlerTest(t, "additive", map[string]string{"keep.txt": "keep"}, nil)
+
+	if err := transfer.SaveState(&transfer.SyncState{
+		DeviceID:  "phone1",
+		Profile:   "PhoneMusic",
+		Direction: config.DirectionPush,
+		Files: []transfer.StateFile{
+			{Path: "keep.txt", Size: 4, ModTime: 1},
+		},
+	}); err != nil {
+		t.Fatalf("saving previous state: %v", err)
+	}
+
+	// A known-empty source snapshot must be distinguishable from "unknown".
+	sess := transfer.NewSessionWithDirection("phone1", "PhoneMusic", config.DirectionPush, nil)
+	sess.SetSourceFiles([]transfer.StateFile{})
+	if err := sess.Save(); err != nil {
+		t.Fatalf("saving session: %v", err)
+	}
+
+	body, _ := json.Marshal(map[string]string{"session": sess.Path})
+	req := httptest.NewRequest(http.MethodPost, "/push/complete", bytes.NewReader(body))
+	w := httptest.NewRecorder()
+	handlePushComplete()(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("complete returned %d: %s", w.Code, w.Body.String())
+	}
+
+	state, err := transfer.LoadState("phone1", "PhoneMusic")
+	if err != nil {
+		t.Fatalf("loading state: %v", err)
+	}
+	if state == nil || len(state.Files) != 0 {
+		t.Fatalf("expected an empty baseline for an empty source, got %+v", state)
 	}
 }

@@ -3,18 +3,18 @@
 ## Current Status
 
 **Phase:** Phase 2 — Polish
-**Last completed:** Android pull restoration + push profiles (client → server), review fixes, clean builds
-**Next:** Manual end-to-end device test (pull + push), then Task 12 auto-sync
+**Last completed:** Pairing bridge fix, last-synced baseline/resume, progress + Stop/Resume UI, review fixes — all tests pass
+**Next:** Finish the manual E2E (music pull, push, small resume/mirror, additive), then Task 12 auto-sync
 
 ---
 
 ## In Progress
 
-None — manual device testing is next.
+- Manual end-to-end test — music pull running/resumable (~151+/1235); push and small-profile resume/mirror tests pending.
 
 ## Up Next
 
-- Manual end-to-end test: pair, pull, push, resume, mirror deletion
+- Finish manual E2E: music completion + zero-delta second sync, push, small resume/mirror, additive
 - 12 Auto-sync on same network
 - 13 mDNS discovery
 - 14 Sync history / logs in UI
@@ -118,6 +118,8 @@ _Add decisions here as they are made during implementation._
 - **Manifest paths are slash-normalized**: `diff.BuildManifest` uses `filepath.ToSlash`, keeping Windows/Android/push manifests comparable.
 - **Deletion ordering**: pull clients and Android skip mirror deletions and completion when any file failed; the session stays resumable. Push mirror deletes only after every upload is verified and complete succeeds.
 - **Push path safety**: containment is checked lexically and against resolved symlinks; symlinked temp files are rejected.
+- **Last-synced baseline** (Phase 5 fix): recipient mtimes are never preserved (Android SAF writes a new one), so the old delta classified every synced file as changed and resume/repeat syncs re-transferred everything. The server now keeps `state/<device-id>-<profile>.json` with the source metadata of what the device actually got, computes deltas against it (`diff.ComputeDeltaWithBase`), and reconciles resume state against source metadata instead of destination mtimes. Pull and push both use it; web-initiated syncs key the baseline by a per-destination device ID.
+- **Progress state** (Phase 5 fix): one Progress card renderer drives live, paused, server-driven, and completed states; counts initialize from session states (no restart at zero), the current filename is shown, Stop leaves a paused card with Resume, and `/web/sessions` is device-filtered with push sessions included.
 
 ---
 

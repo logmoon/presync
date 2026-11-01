@@ -30,6 +30,7 @@ type pushFileInfo struct {
 	Path   string `json:"path"`
 	Size   int64  `json:"size"`
 	Offset int64  `json:"offset"`
+	State  string `json:"state"`
 }
 
 type pushStartResponse struct {
@@ -106,7 +107,19 @@ func handlePushStart() http.HandlerFunc {
 			return
 		}
 
-		delta := diff.ComputeDelta(sourceManifest, destManifest, profile.Mode)
+		// Deltas compare the client's source against the last upload baseline.
+		// Server-side destination mtimes are receive times and must not drive
+		// re-uploads; fall back to the destination comparison on first sync.
+		baseline, baseErr := transfer.LoadState(req.DeviceID, req.Profile)
+		if baseErr != nil {
+			logError("loading push sync state: %v", baseErr)
+		}
+		var delta diff.Delta
+		if baseline != nil {
+			delta = diff.ComputeDeltaWithBase(sourceManifest, destManifest, baseline.Manifest(), profile.Mode)
+		} else {
+			delta = diff.ComputeDelta(sourceManifest, destManifest, profile.Mode)
+		}
 
 		uploadPaths := make([]string, 0, len(delta.ToAdd)+len(delta.ToUpdate))
 		for _, a := range delta.ToAdd {
@@ -148,10 +161,46 @@ func handlePushStart() http.HandlerFunc {
 		}
 
 		if existing != nil {
-			srcIndex := manifestIndex(sourceManifest)
-			for _, p := range uploadPaths {
-				if f, ok := srcIndex[p]; ok {
-					existing.UpsertFile(p, f.Size)
+			existing.SetSourceFiles(transfer.StateFilesFromManifest(sourceManifest))
+
+			// Reconcile against the source, not destination mtimes: a done
+			// upload stays done when the client's file is unchanged and the
+			// server still has it at the right size.
+			dstIndex := manifestIndex(destManifest)
+			deltaNeeds := make(map[string]bool, len(delta.ToAdd)+len(delta.ToUpdate))
+			for _, a := range delta.ToAdd {
+				deltaNeeds[a.Path] = true
+			}
+			for _, a := range delta.ToUpdate {
+				deltaNeeds[a.Path] = true
+			}
+			for _, sf := range sourceManifest.Files {
+				fs := existing.GetFile(sf.Path)
+				if fs == nil {
+					// Only new work enters the session; unchanged files stay
+					// out of it instead of being re-uploaded on every resume.
+					if deltaNeeds[sf.Path] {
+						existing.UpsertFile(sf.Path, sf.Size, sf.ModTime)
+					}
+					continue
+				}
+				sourceChanged := fs.ModTime != 0 && (fs.Size != sf.Size || fs.ModTime != sf.ModTime)
+				dst, inDst := dstIndex[sf.Path]
+				missingAtDestination := !inDst || dst.Size != sf.Size
+				if sourceChanged || missingAtDestination {
+					existing.UpsertFile(sf.Path, sf.Size, sf.ModTime)
+					continue
+				}
+				if fs.ModTime == 0 {
+					// Legacy session without source metadata. The server
+					// cannot prove the phone's current content matches what
+					// was uploaded, so a done entry is re-uploaded once rather
+					// than risk certifying a stale copy.
+					if fs.State == transfer.FileDone {
+						existing.UpsertFile(sf.Path, sf.Size, sf.ModTime)
+						continue
+					}
+					existing.SetFileMeta(sf.Path, sf.Size, sf.ModTime)
 				}
 			}
 			if profile.Mode == "mirror" {
@@ -164,7 +213,13 @@ func handlePushStart() http.HandlerFunc {
 			if err := existing.Save(); err != nil {
 				logError("saving resumed push session: %v", err)
 			}
-			logInfo("push resumed: device=%s profile=%s pending=%d", req.DeviceID, req.Profile, len(files))
+			pending := 0
+			for _, f := range files {
+				if f.State != string(transfer.FileDone) {
+					pending++
+				}
+			}
+			logInfo("push resumed: device=%s profile=%s pending=%d", req.DeviceID, req.Profile, pending)
 			writeJSON(w, http.StatusOK, pushStartResponse{
 				Session:     existing.Path,
 				Files:       files,
@@ -174,10 +229,11 @@ func handlePushStart() http.HandlerFunc {
 		}
 
 		sess := transfer.NewSessionWithDirection(req.DeviceID, req.Profile, config.DirectionPush, uploadPaths)
+		sess.SetSourceFiles(transfer.StateFilesFromManifest(sourceManifest))
 		srcIndex := manifestIndex(sourceManifest)
 		for _, p := range uploadPaths {
 			if f, ok := srcIndex[p]; ok {
-				sess.SetFileSize(p, f.Size)
+				sess.SetFileMeta(p, f.Size, f.ModTime)
 			}
 			// A new session starts from zero even if an orphaned temp file
 			// survived an older, pruned session.
@@ -200,7 +256,7 @@ func handlePushStart() http.HandlerFunc {
 			if f, ok := srcIndex[p]; ok {
 				size = f.Size
 			}
-			files = append(files, pushFileInfo{Path: p, Size: size})
+			files = append(files, pushFileInfo{Path: p, Size: size, State: string(transfer.FilePending)})
 		}
 
 		logInfo("push started: device=%s profile=%s files=%d deletes=%d", req.DeviceID, req.Profile, len(files), len(deletePaths))
@@ -212,39 +268,42 @@ func handlePushStart() http.HandlerFunc {
 	}
 }
 
-// resumePushSession returns the still-pending files with server-owned offsets.
-// Files removed from the source since the session started are dropped from the
-// session; a resumed upload must not wait forever on a file that no longer
-// exists on the device.
+// resumePushSession returns every session file with its state and server-owned
+// offset. Files removed from the source since the session started are dropped;
+// a resumed upload must not wait forever on a file that no longer exists on the
+// device. Done files are included so the UI can show true session progress.
 func resumePushSession(sess *transfer.Session, profile *config.Profile, source diff.Manifest) []pushFileInfo {
 	srcIndex := manifestIndex(source)
 	files := make([]pushFileInfo, 0, len(sess.Files))
 	var dropped []string
 
 	for _, fs := range sess.Files {
-		if fs.State == transfer.FileDone {
-			continue
-		}
-
 		srcFile, ok := srcIndex[fs.Path]
 		if !ok {
 			dropped = append(dropped, fs.Path)
 			continue
 		}
 
-		sess.SetFileSize(fs.Path, srcFile.Size)
+		sess.SetFileMeta(fs.Path, srcFile.Size, srcFile.ModTime)
 
 		offset := int64(0)
-		if full, err := resolvePushPath(profile.Destination, fs.Path); err == nil {
-			offset = pushTempSize(full)
-			if offset > srcFile.Size {
-				os.Remove(full + ".presync-tmp")
-				offset = 0
+		if fs.State != transfer.FileDone {
+			if full, err := resolvePushPath(profile.Destination, fs.Path); err == nil {
+				offset = pushTempSize(full)
+				if offset > srcFile.Size {
+					os.Remove(full + ".presync-tmp")
+					offset = 0
+				}
 			}
+			sess.UpdateOffset(fs.Path, offset)
 		}
-		sess.UpdateOffset(fs.Path, offset)
 
-		files = append(files, pushFileInfo{Path: fs.Path, Size: srcFile.Size, Offset: offset})
+		files = append(files, pushFileInfo{
+			Path:   fs.Path,
+			Size:   srcFile.Size,
+			Offset: offset,
+			State:  string(fs.State),
+		})
 	}
 
 	// Remove after the range: RemoveFile rewrites the slice.
@@ -654,6 +713,33 @@ func handlePushComplete() http.HandlerFunc {
 				}
 				os.Remove(fullPath + ".presync-tmp")
 			}
+		}
+
+		// Persist what the server now holds for this device before dropping
+		// the session. Future deltas compare the client's source against this
+		// baseline instead of server-side mtimes (which are receive times).
+		prev, err := transfer.LoadState(sess.DeviceID, sess.Profile)
+		if err != nil {
+			logError("loading previous push sync state: %v", err)
+		}
+		var sourcePaths map[string]bool
+		if sources := sess.SourceFileSnapshot(); sources != nil {
+			// An empty slice is a known-empty source, not an unknown one.
+			sourcePaths = make(map[string]bool, len(sources))
+			for _, f := range sources {
+				sourcePaths[f.Path] = true
+			}
+		}
+		state := transfer.BuildCompletionState(
+			sess.DeviceID,
+			sess.Profile,
+			config.DirectionPush,
+			prev,
+			sess.Files,
+			sourcePaths,
+		)
+		if err := transfer.SaveState(state); err != nil {
+			logError("saving push sync state: %v", err)
 		}
 
 		// Delete the resolved path, not the client-supplied identifier: a

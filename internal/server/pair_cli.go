@@ -197,9 +197,12 @@ func Unpair() error {
 		}
 	}
 
-	// Delete the device's session files
+	// Delete the device's session files and last-synced baselines
 	if err := transfer.DeleteSessionsForDevice(dev.ID); err != nil {
 		logError("cleaning sessions after unpair: %v", err)
+	}
+	if err := transfer.DeleteStateForDevice(dev.ID); err != nil {
+		logError("cleaning sync state after unpair: %v", err)
 	}
 
 	fmt.Printf("Device %q (ID: %s) removed.\n", dev.Name, dev.ID)
