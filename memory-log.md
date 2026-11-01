@@ -6,6 +6,10 @@ enough. Capped at the last 20 entries; oldest entries drop off as new ones are a
 
 ---
 
+### 2026-11-01 — Auto-sync on same network
+
+Built server-owned auto-sync eligibility (`[daemon] auto_sync` + cooldown + per-profile override, `/auto-sync`), a detached PC `presync watch` (status/stop/once, persisted cooldown), and an Android `dataSync` foreground service that reuses the web sync engine through a hidden WebView (`?autosync=1`). Added the real Settings toggle (disabled when the server disallows it) and an owner-scoped single-sync lock. Review round 1 found two Android lifecycle races plus a local-token race; all fixed and round 2 shipped clean. Go tests, all five E2E scripts, and the APK build pass; on-device auto-sync verification remains.
+
 ### 2026-11-01 — manual E2E + Progress session list
 
 Push and small pull verified end to end on the phone (baseline, changed-file-only upload, stop/resume at exact offsets, mirror delete only after complete, zero-delta repeats); all isolated E2E scripts pass. Fixed the Progress screen to list every session (live, paused, server-side) with per-card Stop/Resume; review found one pulse-dot leak, fixed. Music pull accepted with completion/additive checks deferred.

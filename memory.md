@@ -2,7 +2,7 @@
 
 ## Active Feature
 
-Task 12 — Auto-sync on same network (next up). The manual device E2E and the Progress multi-session list UI are closed and accepted.
+None in progress. Task 12 — Auto-sync on same network — is built, reviewed, and closed. Next up is Task 13 — mDNS discovery.
 
 Branch: main
 
@@ -12,18 +12,18 @@ closing
 
 ## Next Action
 
-Start Task 12 with the Architect Gate: auto-sync on same network — client periodically attempts its stored server address, triggers a sync on success respecting a cooldown (no more than once per N minutes); Android background service, PC lightweight watcher; Settings toggle for global + per-profile override matching `config.toml`'s `auto_sync` (`*bool`). Meanwhile the `music` pull is still finishing on the phone in the background; let it complete, then do the deferred additive check and final zero-delta as follow-ups.
+Start Task 13 (mDNS discovery) with the Architect Gate: server advertises `presync.local` via `grandcat/zeroconf`, client tries `presync.local:<port>` first, falls back to the last stored IP, and writes the resolved IP back to `servers.json` on success. Before or alongside that, finish the two deferred device checks: install the new APK and verify auto-sync on the phone, and check whether the 6.8G `music` pull completed so its additive/zero-delta follow-ups can run.
 
 ## Decisions & Problems Not Yet Elsewhere
 
-- E2E fixtures: `~/presync-test/small/big.bin` (30MB, small source no longer has a.txt); phone push source `/sdcard/Download/presync-push-src` (a.txt, c.txt, sub/c.txt, big.bin); `~/presync-test/push-recv` holds all of those except b.txt (mirror-test delete).
-- Push/small E2E passed end to end: 5-file push incl. 30MB big.bin, changed-file-only re-upload, Stop at 23,592,960/31,457,280 → Resume at that offset, zero-delta, mirror delete only on complete. Small pull: baseline, Stop at 11,967,711/31,457,280 → resume at offset, mirror delete a.txt, zero-delta. Isolated scripts all pass (transfer 48, connect 13, push 29, pairing 19).
-- The music session (`8bc052af7b3ebe88-music-20261101T181657...`) has a 30-minute inactivity limit: if it goes stale before completion it is discarded and, with no baseline written yet, the next sync re-transfers the whole 7.26GB.
-- The phone still runs the pre-fix `app.js` until the page is reloaded; the new Progress list (all sessions, per-card Stop/Resume) needs an on-device reload check.
-- Throughput is per-file-overhead-bound, not WiFi-bound: a single 30MB file resumed at ~10MB/s, while ~5.4MB MP3s average ~3s each (SAF write/rename + native hash + confirm per file).
+- Auto-sync is committed on `main`: `e61ff85 feat: add auto-sync on same network`; `a56082e fix: serialize local-token creation across processes`. Server config owns eligibility (`[daemon] auto_sync`, `auto_sync_cooldown_minutes`, per-profile `auto_sync` pointer; push never eligible); `/auto-sync` returns `{cooldown_minutes, profiles}`. PC uses detached `presync watch` (`--status`, `--stop`, `--once`; cooldown persisted in `servers.json`). Android uses a `dataSync` foreground service with a hidden WebView loading `?autosync=1`; the notification has a "Turn off auto-sync" action. The service and visible WebView share an owner-scoped manual-sync lock.
+- Review round 1: SHIP WITH FIXES (two IMPORTANT Android lifecycle races + the local-token race). All fixed; round 2: SHIP, no regressions. `scripts/test-watch.sh` adds 10 E2E checks and all five scripts pass.
+- Auto-sync on-device verification is still pending. Test: rebuild/install `android/app/build/outputs/apk/debug/app-debug.apk`; set `[daemon] auto_sync = true` (optionally per-profile overrides) and restart the server; open the app, Settings → enable Auto-sync; background the app; toggle WiFi or wait ≤60s; verify sync + notification, tap "Turn off auto-sync", and confirm a second trigger inside the cooldown does nothing (including after an app restart).
+- The previous session's music-pull follow-ups still stand: check whether the full 6.8G pull completed; then run the additive check and a final zero-delta sync. The 30-minute inactivity rule can discard a stalled session and force a full re-transfer because no baseline was written yet.
+- Pre-existing uncommitted tooling changes (`.opencode/**`, `AGENTS.md`, `opencode.json`) are not part of the auto-sync commits and are still in the worktree; do not include them accidentally.
 
 ## Open Questions
 
-- Does the full 6.8G music pull complete cleanly, and does the additive check behave (file added lands; deleted from source stays on phone)?
-- Does the final music zero-delta sync report no transfers once the baseline exists?
-- On-device rendering of the new Progress list (live + paused cards visible together) after reload.
+- Does auto-sync work end to end on the real phone (network callback, notification action, cooldown across process restarts)?
+- Did the music pull complete, and do the additive check + final zero-delta behave?
+- Does the Progress list render correctly on-device (live + paused cards together) after reloading the new `app.js`?
