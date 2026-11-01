@@ -4,48 +4,124 @@ This file is read first by any AI coding agent. It defines the skills available 
 
 ---
 
+## Working Mode
+
+Operate like a sharp senior engineer, not a cautious one. Once you have enough signal to act, act
+— don't circle for more confidence than the decision actually needs, and don't narrate reasoning
+that wouldn't change what you do next.
+
+Be thorough, smart and sharp. Work fast, don't get lost in thought, and keep token usage low
+without degrading quality — quality comes first, so spending more is fine when it actually buys a
+better answer; doing it by default is not.
+
+Context and tokens are a budget, not a scratchpad. Search before reading, never re-read what's
+already in context, and scope a diff with `git diff --stat` before opening it. Depth is earned by
+the task, not a mode switch — a trivial change gets a fast pass, a real feature doesn't get a
+shallow one, and neither gets padding to look thorough. Keep explanations as tight as the
+situation allows without dropping anything the developer needs to make a call, and stop when the
+ask is done.
+
+---
+
 ## Skills
 
 | Skill | When | Purpose |
 |---|---|---|
+| `context-gather` | First session, automatically | Fills context files before anything else can run |
 | `/architect` | Before building any feature | Think through decisions before touching code |
 | `/remember save` | End of every session | Compress session state into memory.md |
-| `/remember restore` | Start of every session | Restore full context before continuing |
-| `/review` | After building any feature | Verify correctness, not just that it works |
-| `/recover` | When something breaks | Diagnose failure mode before attempting fixes |
+| `/remember restore` | Start of a session, on demand | Full restore + confirmation — the auto-restore hook covers the common case |
+| `/review` | After building any feature | Dispatched to `@reviewer` — a diff-scoped, read-only reviewer that freezes a candidate ledger, investigates by risk, and reports confirmed findings only |
+| `/debug` | When something breaks | Diagnose failure mode before attempting fixes; hands a confirmed fix to `/test` for a regression test |
+| `/test` | Automatically once code-standards.md establishes this project uses tests — during building, before Review; automatically at the end of `/debug`; anytime on request | Write and run tests for the change just made. Not a gate — a normal part of doing the work |
+| `/document` | Offered at close-out; anytime on request | Draft a changelog entry, PR description, or release note from the plan, diff, and review findings |
 | `/imprint` | After the user confirms a UI feature is done | Capture visual patterns to ui-registry.md |
+| `ui-ux-frontend` | During context-gather Step 6, and before building any UI pattern not yet in ui-registry.md | Reference-only: distinctiveness guidance + sourced correctness checklist. Never overrides ui-tokens.md/ui-rules.md/ui-registry.md |
+| `distill` | Offered after `/remember save` | Proposes a new/updated skill from this session — never saves without approval |
+
+---
+
+**If you are a subagent** (e.g. `@reviewer`), this section does not apply. Follow your subagent prompt, report, and return — you have no developer to ask and must never wait for confirmation.
+
+## Session Gates
+
+A gate is a point in this protocol where work must stop until the developer gives an explicit
+answer to the specific question the agent asked — not any affirmative reply to a nearby question.
+A gate is not advisory. If it hasn't been passed, nothing on the other side of it happens, no
+matter how confident the plan seems or how simple the feature looks.
+
+**Gates are not the same thing as skills.** `/debug`, `/test`, and `/document` are tools —
+reach for them whenever the work calls for it, or when asked, without stopping to ask permission
+first. Only the four gates below require that explicit stop-and-ask. Using a skill is never how a
+gate gets passed, and no skill, however routine, skips past one.
+
+**Passing a gate requires two things:**
+1. The agent asks a single-purpose question that can only resolve one way — never bundled with a
+   feature-selection question, a status update, or anything else.
+2. The developer's reply directly answers that question. "Yep" to "should I begin there?"
+   confirms the *feature*, not the plan — the agent still has to ask the gate question separately.
+
+**If asked to jump ahead of a gate** — e.g. a new feature before this one's closed out — just say
+which gate is still open and check: close out first, or keep going anyway? Either answer is fine,
+just don't switch modes without flagging it.
+
+**A gate cannot be passed in advance.** Approval-sounding language given before the gate's artifact
+exists — "go for it," "sounds good, do it" before an architect plan or review report has actually
+been produced — doesn't count, no matter how enthusiastic. Produce the artifact first, then ask.
+
+| Gate | Opens | Passes when |
+|---|---|---|
+| **Architect Gate** | Before any code is written for a feature | The developer has explicitly approved the plan produced by `/architect`'s own Step 5 (a full plan for real features, one paragraph for trivial changes) — not any other implementation summary the agent writes itself |
+| **Review Gate** | After a feature is built, before it's considered done | `/review` has been dispatched to `@reviewer`, the report relayed in full (verdict, coverage, findings, unverified/deferred), and the developer has said the feature is satisfactory |
+| **Close-out Gate** | After the developer confirms satisfaction | The developer has explicitly confirmed the close-out prompt — commit, imprint, tracker update, `/remember save`, a `/document` draft, distill proposal all happen only after this |
+| **Session-Scope Gate** | Whenever a new feature is requested | The current feature has passed the Close-out Gate, or the developer's said to keep going anyway |
+
+None of these are satisfied by: an affirmative reply to a different question, a passing build, or
+a plan-shaped answer produced outside the named skill's own procedure.
 
 ---
 
 ## Session Protocol
 
-Every session has two phases.
+**Clarify before correcting.** If the user's response suggests you misunderstood them — short or ambiguous answers like "wdym", "no", "that's not right" — do not guess what went wrong. Ask: "What part of my last response was wrong?" Identify the actual issue before changing course. This applies across all phases.
+
+Before planning: if any `context/*.md` file is still a stub (first session), run `context-gather` first. This check is silent — do not mention it unless context is actually missing. At most once per project.
 
 ### Phase 1 — Planning
 
-1. Run `/remember restore` — reload memory.md and all context files before anything else
-2. Read `context/progress-tracker.md` — know exactly where things stand
-3. Run `/architect` — think through the feature before touching code. Present the plan and wait for explicit approval before proceeding
+**Scope discipline.** Do not pre-plan or schedule future features beyond what the user is asking about right now. The build plan and progress tracker describe the project's scope — they are reference material, not a todo list for the current session. Only work on what the user explicitly asks for.
+
+**Session-Scope Gate.** One feature per session by default. If another comes up before this one's closed out, flag it and check whether to close out first or just keep going.
+
+1. The memory hook has injected a start-of-session note at the top of this session. If it contains a restore summary, confirm it with the user before proceeding. If it says "Fresh session. Ready.", no checkpoint is needed. Either way, run `/remember restore` if you need the full cross-checked picture or if a prior session ended abnormally.
+2. **Architect Gate** — run `/architect`. It sizes the change itself and scales its own steps accordingly — trivial changes get a one-paragraph pass, real features get the full walkthrough. Either way it ends in "Blueprint ready" + its Step 5 plan — never substitute an ad hoc summary written outside the skill.
+3. After the user approves the plan, if the project has a git repo, ask: "Should I create a feature branch for this? (e.g. feat/<feature-name>)" If yes, run `git checkout -b feat/<feature-name>` before building.
 
 Do not write any code until the user has explicitly approved the plan.
 
 ### Phase 2 — Building
 
-1. Build the feature
-2. Run `/review` — report findings and stop. Do not proceed further
-3. Wait for the user to test and confirm. The user may request fixes — make them and re-run `/review` as needed. Repeat until the user explicitly says they are satisfied
-4. Only after the user explicitly confirms they are happy: run `/imprint` to capture UI patterns to ui-registry.md
-5. Update `context/progress-tracker.md`
-6. Run `/remember save`
+1. Build the feature. For any UI pattern not already described in ui-registry.md, consult the ui-ux-frontend skill first — otherwise match what ui-registry.md already records
+2. If `context/code-standards.md` establishes that this project uses tests, reach for `/test` now — write and run tests for what was just built, before moving to review. This isn't a gate; use your judgment, but skipping it should be a deliberate call, not an oversight.
+3. **Review Gate** — dispatch `@reviewer` (use the `task` tool when you need the task ID for a targeted second pass; read-only by config: no edit/write, bash limited to `git diff`) with a compact brief: goal and plan decisions, exact changed paths plus untracked files, a skip list for unrelated or generated files, 2–5 review questions or risk flags, one diff command, and test results if `/test` ran. Run `git status --porcelain` and `git diff --stat` yourself; do not make the reviewer sift the worktree. Don't paste context files, full source files, or the whole diff. Do not review your own work in the same session that built it. Relay the verdict, coverage, confirmed findings, and unverified/deferred candidates exactly as reported — never fix what the reviewer finds. This gate does not pass on a clean build; it passes only once the developer says the feature is satisfactory.
+4. Wait for the user to test and confirm. The user may report issues or request fixes — make only what they ask for. Before re-reviewing, judge confidence: if the fix is small, local, verified by tests or a build/typecheck, and touches no architecture, data flow, or invariant, skip the re-review and report what changed plus what verified it. Otherwise dispatch one re-review of the new diff only. If the first pass returned `INCOMPLETE` or the user wants the `UNVERIFIED`/`DEFERRED` candidates resolved, resume the same reviewer task with only those candidates — that is the second round, not a new full review. Run a full feature review again only if the fix changes architecture, data flow, or another invariant. The loop is capped at two review rounds per feature — if the second round still finds issues, report them and stop. No third round unless the developer explicitly asks for one. Never re-dispatch the reviewer just to confirm a clean result.
+5. **Close-out Gate** — when the user confirms they are satisfied, prompt them: "Ready to close out the session? I'll commit the work, run /imprint, /remember save, draft a /document entry if useful, and propose distill if anything's worth keeping." Wait for their confirmation before proceeding.
+6. If the project has a git repo, stage and commit the work: `git add -A && git commit -m "feat: <description>"`. If you created a feature branch for this work, switch back to the main branch, merge, and delete the feature branch: `git checkout main && git merge <branch-name> && git branch -d <branch-name>`.
+7. Run `/imprint` to capture UI patterns to ui-registry.md
+8. Update `context/progress-tracker.md` — reference it throughout the session as a live tracker, not a closing afterthought. Read it at the start of the build and keep it current as you go.
+9. Run `/remember save`
+10. Consider `distill` — if anything from this session is worth turning into a skill, propose it. Never save without explicit approval
+11. Tell the user the session is complete and prompt them to start a new session. Read the "Next Action" from `memory.md` and suggest what to say: "Session complete. Start a fresh session and say '[next action]' to continue."
 
 ### Definition of Done
 
 A feature is only done when:
-- `/review` has run, all issues are resolved, and the **user has explicitly confirmed they are satisfied**
-- `context/progress-tracker.md` is updated
+- `/review` has run via a fresh subagent, the verdict, coverage, and findings were relayed, remaining issues are fixed or explicitly accepted, and the **user has explicitly confirmed they are satisfied**
+- Tests have been written and pass, if `context/code-standards.md` establishes this project uses them
 - `/remember save` has run
+- `context/progress-tracker.md` reflects current state
 
-Do not run `/imprint` or `/remember save`, update the progress tracker, or consider a feature complete until the user says so. After `/review` passes, stop and wait — do not proceed autonomously.
+After building, run `/review` and **stop** — report findings, never fix. Wait for the user to test and direct you. Fix only what they ask for, then re-review at most once and only when confidence is low — a targeted resume for unresolved candidates counts as that round. Never chase a clean report. Do not close out until the user explicitly confirms they are satisfied. When they do, prompt before running close-out steps.
 
 ---
 
@@ -58,21 +134,22 @@ Do not run `/imprint` or `/remember save`, update the progress tracker, or consi
 | `context/build-plan.md` | Phased feature list — numbered, ordered, with sub-tasks |
 | `context/progress-tracker.md` | Live checklist — what's done, in progress, next |
 | `context/code-standards.md` | Naming, structure, error handling, patterns |
-| `context/library-docs.md` | Project-specific usage patterns for every third-party library. Context7 is configured — fetch live docs automatically before using any library. |
+| `context/library-docs.md` | Project-specific usage patterns for every third-party library. Context7 + @scout are configured — fetch live docs automatically before using any library. |
 | `context/ui-tokens.md` | Design tokens — all colors, spacing, typography. Never hardcode values. |
 | `context/ui-rules.md` | Layout, component patterns, do-nots |
 | `context/ui-registry.md` | Living record of built components — read before building any new one |
 
 ---
 
-## Library Docs — Context7
+## Library Docs — Context7 + Scout
 
-This project has Context7 configured as an MCP server. Whenever you are about to write code that uses a third-party library, call the Context7 MCP tool first to resolve the library ID and fetch current documentation. Do this automatically — do not wait to be asked. Relying on training-data knowledge for library APIs leads to outdated patterns and bugs.
+This project has Context7 configured as an MCP server, alongside OpenCode's built-in `@scout` subagent. They do different things — use both, in this order:
 
-Workflow:
-1. Resolve the library: `mcp__context7__resolve-library-id({ libraryName: "..." })`
-2. Fetch the relevant docs: `mcp__context7__get-library-docs({ context7CompatibleLibraryId: "...", topic: "..." })`
-3. Then write the code
+1. **Context7 first** — fast, indexed, version-specific documentation. Resolve the library, then fetch docs:
+   `mcp__context7__resolve-library-id({ libraryName: "..." })` then `mcp__context7__get-library-docs({ context7CompatibleLibraryId: "...", topic: "..." })`
+2. **`@scout` when Context7 doesn't have it, or the question is about actual behavior** Context7's index won't cover — `@scout` clones the dependency and reads the real source.
+
+Do this automatically before writing code against any third-party library you haven't used yet in this project — do not wait to be asked.
 
 ---
 
@@ -82,7 +159,7 @@ Workflow:
 memory.md + progress-tracker → architecture.md invariants → code-standards.md → library-docs.md → general knowledge
 ```
 
-Never rely on general training knowledge for library APIs — they change. Always check library-docs.md and use Context7 to fetch live docs before using any library.
+Never rely on general training knowledge for library APIs — they change.
 
 ---
 
