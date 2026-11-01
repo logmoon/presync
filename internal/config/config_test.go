@@ -241,3 +241,118 @@ func TestSaveConfigRejectsInvalid(t *testing.T) {
 		t.Error("expected no config file written for rejected saves")
 	}
 }
+
+func TestLoadPushProfile(t *testing.T) {
+	dir := t.TempDir()
+	cfgContent := `[daemon]
+port = 7700
+log_level = "info"
+
+[[profiles]]
+name = "PhoneMusic"
+direction = "push"
+destination = "/home/user/PhoneMusic"
+mode = "mirror"
+`
+	if err := os.WriteFile(filepath.Join(dir, "config.toml"), []byte(cfgContent), 0o644); err != nil {
+		t.Fatalf("writing test config: %v", err)
+	}
+	t.Setenv("PRESYNC_CONFIG_DIR", dir)
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() returned error: %v", err)
+	}
+	if len(cfg.Profiles) != 1 {
+		t.Fatalf("expected 1 profile, got %d", len(cfg.Profiles))
+	}
+	p := cfg.Profiles[0]
+	if p.Direction != DirectionPush {
+		t.Errorf("direction: got %q, want %q", p.Direction, DirectionPush)
+	}
+	if p.Destination != "/home/user/PhoneMusic" {
+		t.Errorf("destination: got %q", p.Destination)
+	}
+}
+
+func TestLoadDirectionDefaultsToPull(t *testing.T) {
+	dir := t.TempDir()
+	cfgContent := `[daemon]
+port = 7700
+log_level = "info"
+
+[[profiles]]
+name = "Music"
+source = "/home/user/Music"
+mode = "additive"
+
+[profiles.destinations]
+local = "/tmp/music"
+`
+	if err := os.WriteFile(filepath.Join(dir, "config.toml"), []byte(cfgContent), 0o644); err != nil {
+		t.Fatalf("writing test config: %v", err)
+	}
+	t.Setenv("PRESYNC_CONFIG_DIR", dir)
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() returned error: %v", err)
+	}
+	if cfg.Profiles[0].Direction != DirectionPull {
+		t.Errorf("direction: got %q, want %q", cfg.Profiles[0].Direction, DirectionPull)
+	}
+}
+
+func TestValidateDirectionRules(t *testing.T) {
+	base := func() Config {
+		return Config{
+			Daemon: DaemonConfig{Port: 7700, LogLevel: "info"},
+		}
+	}
+
+	tests := []struct {
+		name    string
+		profile Profile
+		wantErr bool
+	}{
+		{
+			name:    "push requires destination",
+			profile: Profile{Name: "p", Direction: DirectionPush, Mode: "additive"},
+			wantErr: true,
+		},
+		{
+			name:    "push rejects destinations map",
+			profile: Profile{Name: "p", Direction: DirectionPush, Destination: "/tmp/p", Mode: "additive", Destinations: map[string]string{"local": "/tmp/x"}},
+			wantErr: true,
+		},
+		{
+			name:    "push accepts mirror",
+			profile: Profile{Name: "p", Direction: DirectionPush, Destination: "/tmp/p", Mode: "mirror"},
+			wantErr: false,
+		},
+		{
+			name:    "pull rejects destination",
+			profile: Profile{Name: "p", Direction: DirectionPull, Destination: "/tmp/p", Mode: "additive"},
+			wantErr: true,
+		},
+		{
+			name:    "invalid direction",
+			profile: Profile{Name: "p", Direction: "sideways", Mode: "additive"},
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := base()
+			cfg.Profiles = []Profile{tt.profile}
+			err := validate(cfg)
+			if tt.wantErr && err == nil {
+				t.Fatal("expected error, got nil")
+			}
+			if !tt.wantErr && err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		})
+	}
+}

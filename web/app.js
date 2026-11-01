@@ -7,6 +7,19 @@
     var activeScreen = "home";
     var destSelections = {};
     var androidSyncActive = false;
+    var bridgeCallbackSeq = 0;
+
+    // Android's JavascriptInterface can only receive strings, not functions.
+    // Each callback is registered on window under a generated name and the
+    // name is passed to the bridge; invokeCallback evaluates it by name.
+    function bridgeCallback(fn) {
+        var name = "__presyncBridgeCb" + (++bridgeCallbackSeq);
+        window[name] = function (result) {
+            delete window[name];
+            fn(result);
+        };
+        return name;
+    }
 
     // --- API helper ---
 
@@ -138,38 +151,64 @@
             var androidBase = isAndroid() ? (window.AndroidBridge.getDestinationDisplayPath() || "") : "";
             for (var i = 0; i < profiles.length; i++) {
                 var p = profiles[i];
+                var isPush = p.direction === "push";
                 var chips = "";
-                if (!isAndroid() && p.destinations) {
-                    var keys = Object.keys(p.destinations);
-                    var singleDest = keys.length === 1;
-                    chips = '<div class="dest-chips" data-profile="' + esc(p.name) + '">';
-                    for (var j = 0; j < keys.length; j++) {
-                        var k = keys[j];
-                        var selected = destSelections[p.name] && destSelections[p.name].indexOf(k) !== -1;
-                        var cls = "dest-chip";
-                        if (selected) cls += " selected";
-                        if (singleDest) cls += " locked";
-                        chips += '<span class="' + cls + '" data-dest="' + esc(k) + '" title="' + esc(p.destinations[k]) + '">' + esc(k) + "</span>";
-                    }
-                    chips += "</div>";
-                }
                 var destSubtitle = "";
-                if (isAndroid()) {
-                    if (androidBase) {
-                        destSubtitle = '<div class="card-subtitle">Sync folder: ' + esc(androidBase + "/" + p.name) + '</div>';
+                var action = "";
+                var mainSubtitle = p.source;
+
+                if (isPush) {
+                    mainSubtitle = isAndroid() ? "" : (p.destination || "");
+                    if (isAndroid()) {
+                        var pushSource = window.AndroidBridge.getPushSourceDisplayPath(p.name) || "";
+                        if (pushSource) {
+                            destSubtitle = '<div class="card-subtitle">Upload folder: ' + esc(pushSource) + "</div>";
+                            action = '<button class="btn btn-primary btn-sm" data-push="' + esc(p.name) + '">Send to PC</button>';
+                        } else {
+                            destSubtitle = '<div class="card-subtitle" style="color:var(--status-warning)">No upload folder selected — choose one</div>';
+                            action = '<button class="btn btn-primary btn-sm" data-pick-push="' + esc(p.name) + '">Choose folder</button>';
+                        }
                     } else {
-                        destSubtitle = '<div class="card-subtitle" style="color:var(--status-warning)">No folder selected — go to Settings</div>';
+                        destSubtitle = '<div class="card-subtitle">Receives from a paired device</div>';
                     }
+                } else {
+                    if (!isAndroid() && p.destinations) {
+                        var keys = Object.keys(p.destinations);
+                        var singleDest = keys.length === 1;
+                        chips = '<div class="dest-chips" data-profile="' + esc(p.name) + '">';
+                        for (var j = 0; j < keys.length; j++) {
+                            var k = keys[j];
+                            var selected = destSelections[p.name] && destSelections[p.name].indexOf(k) !== -1;
+                            var cls = "dest-chip";
+                            if (selected) cls += " selected";
+                            if (singleDest) cls += " locked";
+                            chips += '<span class="' + cls + '" data-dest="' + esc(k) + '" title="' + esc(p.destinations[k]) + '">' + esc(k) + "</span>";
+                        }
+                        chips += "</div>";
+                    }
+
+                    if (isAndroid()) {
+                        if (androidBase) {
+                            destSubtitle = '<div class="card-subtitle">Sync folder: ' + esc(androidBase + "/" + p.name) + '</div>';
+                        } else {
+                            destSubtitle = '<div class="card-subtitle" style="color:var(--status-warning)">No folder selected — go to Settings</div>';
+                        }
+                    }
+                    action = '<button class="btn btn-primary btn-sm" data-profile="' + esc(p.name) + '">Sync Now</button>';
                 }
+
+                var badges = '<span class="mode-badge">' + esc(p.mode) + "</span>";
+                if (isPush) badges += '<span class="mode-badge">push</span>';
+
                 html +=
                     '<div class="card">' +
                     '<div class="card-title">' + esc(p.name) + "</div>" +
-                    '<div class="card-subtitle">' + esc(p.source) + "</div>" +
+                    (mainSubtitle ? '<div class="card-subtitle">' + esc(mainSubtitle) + "</div>" : "") +
                     destSubtitle +
                     chips +
                     '<div style="display:flex;justify-content:space-between;align-items:center;margin-top:var(--space-2)">' +
-                    '<span class="mode-badge">' + esc(p.mode) + "</span>" +
-                    '<button class="btn btn-primary btn-sm" data-profile="' + esc(p.name) + '">Sync Now</button>' +
+                    '<div style="display:flex;gap:var(--space-1);align-items:center">' + badges + "</div>" +
+                    action +
                     "</div></div>";
             }
 
@@ -197,6 +236,25 @@
                     triggerSync(this.getAttribute("data-profile"), this);
                 });
             }
+
+            // Bind push source picker / send handlers
+            var pickButtons = el.querySelectorAll("button[data-pick-push]");
+            for (var pb = 0; pb < pickButtons.length; pb++) {
+                pickButtons[pb].addEventListener("click", function () {
+                    var name = this.getAttribute("data-pick-push");
+                    window.onPushSourcePicked = function () {
+                        render("home");
+                    };
+                    window.AndroidBridge.pickPushSourceFolder(name);
+                });
+            }
+
+            var pushButtons = el.querySelectorAll("button[data-push]");
+            for (var sb = 0; sb < pushButtons.length; sb++) {
+                pushButtons[sb].addEventListener("click", function () {
+                    pushToDevice(this.getAttribute("data-push"), this);
+                });
+            }
         }).catch(function () {
             el.innerHTML =
                 '<h1>presync</h1>' +
@@ -220,29 +278,34 @@
     }
 
     function triggerSync(profileName, btn) {
-        var selected = destSelections[profileName] || [];
-        if (selected.length === 0) {
-            alert("Select at least one destination");
-            return;
-        }
-
         btn.disabled = true;
         btn.textContent = "Starting...";
 
         if (isAndroid()) {
+            // Android picks its own destination folder via SAF; there is no
+            // server-side destination list to select.
             syncToDevice(profileName, btn);
-        } else {
-            api("POST", "/web/sync", { profile: profileName, destinations: selected }).then(function () {
-                currentSession = "web";
-                showProgressTab(true);
-                setProgressPulse(true);
-                navigate("progress");
-            }).catch(function (err) {
-                btn.disabled = false;
-                btn.textContent = "Sync Now";
-                alert(err.error || "Failed to start sync");
-            });
+            return;
         }
+
+        var selected = destSelections[profileName] || [];
+        if (selected.length === 0) {
+            btn.disabled = false;
+            btn.textContent = "Sync Now";
+            alert("Select at least one destination");
+            return;
+        }
+
+        api("POST", "/web/sync", { profile: profileName, destinations: selected }).then(function () {
+            currentSession = "web";
+            showProgressTab(true);
+            setProgressPulse(true);
+            navigate("progress");
+        }).catch(function (err) {
+            btn.disabled = false;
+            btn.textContent = "Sync Now";
+            alert(err.error || "Failed to start sync");
+        });
     }
 
     function syncToDevice(profileName, btn) {
@@ -266,7 +329,7 @@
         // Build a real destination manifest so the server computes a delta.
         // A missing folder or manifest failure falls back to an empty manifest
         // (full sync) rather than failing the whole sync.
-        window.AndroidBridge.buildManifest(profileName, function (result) {
+        window.AndroidBridge.buildManifest(profileName, bridgeCallback(function (result) {
             var manifest = { files: [] };
             if (result.success) {
                 try {
@@ -276,7 +339,7 @@
                 }
             }
             startAndroidSync(profileName, btn, deviceId, manifest);
-        });
+        }));
     }
 
     function startAndroidSync(profileName, btn, deviceId, destManifest) {
@@ -314,9 +377,14 @@
             var errors = 0;
 
             if (files.length === 0) {
+                // An empty delta still gets a session, and in mirror mode it
+                // can carry deletions. Route through the normal finish path so
+                // they are applied before completing.
                 btn.disabled = false;
                 btn.textContent = "Sync Now";
-                alert("Already up to date");
+                finishAndroidSync(profileName, sessionPath, delta, 0, 0, 0, function (ok) {
+                    alert(ok ? "Already up to date" : "Could not apply deletions; a later sync will retry");
+                });
                 return;
             }
 
@@ -334,16 +402,40 @@
 
                 var f = files[done + errors];
 
-                // Files the server marked with a SHA256 are already done
-                // (resume) — skip them without re-fetching.
-                if (f.sha256) {
+                // Files already completed in a resumed session need neither a
+                // transfer nor a local hash — the server verified them before
+                // marking them done.
+                if (f.state === "done") {
                     done++;
                     syncNext();
                     return;
                 }
 
                 updateSyncProgress(profileName, done, files.length, errors);
-                fetchAndroidFile(profileName, sessionPath, f.path, function (ok) {
+
+                // A SHA256 on a pending file means the local copy is
+                // size+mtime-ambiguous: hash it and confirm if it already
+                // matches, otherwise (re)transfer.
+                if (f.sha256) {
+                    verifyAndroidFile(profileName, sessionPath, f.path, f.sha256, function (verified) {
+                        if (verified) {
+                            done++;
+                            syncNext();
+                            return;
+                        }
+                        fetchAndroidFileWithRetry(profileName, sessionPath, f.path, function (ok) {
+                            if (ok) {
+                                done++;
+                            } else {
+                                errors++;
+                            }
+                            syncNext();
+                        });
+                    });
+                    return;
+                }
+
+                fetchAndroidFileWithRetry(profileName, sessionPath, f.path, function (ok) {
                     if (ok) {
                         done++;
                     } else {
@@ -361,19 +453,90 @@
         });
     }
 
+    // Confirms a size+mtime-ambiguous file without transferring it: hash the
+    // local copy natively and ask the server to mark it done when it matches.
+    function verifyAndroidFile(profileName, sessionPath, filePath, serverHash, onDone) {
+        var bridgePath = profileName + "/" + filePath;
+
+        window.AndroidBridge.hashFile(bridgePath, bridgeCallback(function (hashRes) {
+            if (!hashRes.success) {
+                onDone(false);
+                return;
+            }
+
+            var localHash = null;
+            try {
+                localHash = JSON.parse(hashRes.data).hash;
+            } catch (e) {
+                onDone(false);
+                return;
+            }
+            if (!localHash || localHash !== serverHash) {
+                onDone(false);
+                return;
+            }
+
+            fetch("/sync/confirm", {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                    "X-Presync-Token": token
+                },
+                body: JSON.stringify({
+                    session: sessionPath,
+                    path: filePath,
+                    sha256: localHash
+                })
+            }).then(function (res) {
+                return res.json();
+            }).then(function (result) {
+                onDone(!!result.ok);
+            }).catch(function () {
+                onDone(false);
+            });
+        }));
+    }
+
+    // Retries a single file up to 3 times within one run, matching the PC
+    // client's in-run retry behavior. Network failures keep the temp file, so
+    // the retry resumes from its byte count.
+    function fetchAndroidFileWithRetry(profileName, sessionPath, filePath, onDone) {
+        var attempt = 0;
+
+        function tryOnce() {
+            attempt++;
+            fetchAndroidFile(profileName, sessionPath, filePath, function (ok) {
+                if (ok || attempt >= 3) {
+                    onDone(ok);
+                    return;
+                }
+                setTimeout(tryOnce, 1000);
+            });
+        }
+
+        tryOnce();
+    }
+
     // Streams one file from the server in bounded chunks through the Android
     // bridge, verifies the SHA-256 natively, renames on confirmed success.
     function fetchAndroidFile(profileName, sessionPath, filePath, onDone) {
         var bridgePath = profileName + "/" + filePath;
         var CHUNK_BYTES = 512 * 1024;
 
-        function fail() {
-            window.AndroidBridge.abortFile(bridgePath, function () {
+        // A network failure keeps the temp file so the retry (or next run)
+        // resumes from its byte count. A bad/complete-but-wrong temp is
+        // discarded so the next attempt starts clean.
+        function fail(discardTemp) {
+            if (!discardTemp) {
                 onDone(false);
-            });
+                return;
+            }
+            window.AndroidBridge.abortFile(bridgePath, bridgeCallback(function () {
+                onDone(false);
+            }));
         }
 
-        window.AndroidBridge.tempFileSize(bridgePath, function (sizeRes) {
+        window.AndroidBridge.tempFileSize(bridgePath, bridgeCallback(function (sizeRes) {
             var offset = 0;
             if (sizeRes.success) {
                 try {
@@ -397,9 +560,13 @@
             }
 
             fetch(url, fetchOpts).then(function (res) {
-                if (!res.ok) throw new Error("fetch failed");
+                if (!res.ok) {
+                    fail(true);
+                    return;
+                }
                 if (!res.body || typeof res.body.getReader !== "function") {
-                    throw new Error("streaming not supported");
+                    fail(true);
+                    return;
                 }
 
                 var reader = res.body.getReader();
@@ -410,16 +577,16 @@
                         if (failed) return;
                         if (result.done) {
                             reader.releaseLock();
-                            window.AndroidBridge.finishFile(bridgePath, function (fin) {
+                            window.AndroidBridge.finishFile(bridgePath, bridgeCallback(function (fin) {
                                 if (!fin.success) {
-                                    fail();
+                                    fail(true);
                                     return;
                                 }
                                 var hash = null;
                                 try {
                                     hash = JSON.parse(fin.data).hash;
                                 } catch (e) {
-                                    fail();
+                                    fail(true);
                                     return;
                                 }
                                 var confirmBody = JSON.stringify({
@@ -438,16 +605,16 @@
                                     return res.json();
                                 }).then(function (confirmResult) {
                                     if (confirmResult.ok) {
-                                        window.AndroidBridge.renameFile(bridgePath, function (ren) {
+                                        window.AndroidBridge.renameFile(bridgePath, bridgeCallback(function (ren) {
                                             onDone(ren.success);
-                                        });
+                                        }));
                                     } else {
-                                        fail();
+                                        fail(true);
                                     }
                                 }).catch(function () {
-                                    fail();
+                                    fail(true);
                                 });
-                            });
+                            }));
                             return;
                         }
 
@@ -455,7 +622,7 @@
                         return bridgeCallWithWatchdog("writeChunk", bridgePath, b64, function (wr) {
                             if (!wr.success) {
                                 failed = true;
-                                fail();
+                                fail(true);
                                 return;
                             }
                             pump();
@@ -463,16 +630,16 @@
                     }).catch(function () {
                         if (!failed) {
                             failed = true;
-                            fail();
+                            fail(false);
                         }
                     });
                 }
 
                 pump();
             }).catch(function () {
-                fail();
+                fail(false);
             });
-        });
+        }));
     }
 
     // Calls a bridge method with a timeout: if the callback never fires
@@ -485,12 +652,12 @@
             onResult({ success: false, data: "bridge call timed out" });
         }, 60 * 1000);
 
-        window.AndroidBridge[method](path, arg, function (result) {
+        window.AndroidBridge[method](path, arg, bridgeCallback(function (result) {
             if (called) return;
             called = true;
             clearTimeout(watchdog);
             onResult(result);
-        });
+        }));
     }
 
     function toBase64(bytes) {
@@ -503,29 +670,369 @@
     }
 
     // Applies mirror-mode deletions, then completes the session.
-    function finishAndroidSync(profileName, sessionPath, delta, done, total, errors) {
+    function finishAndroidSync(profileName, sessionPath, delta, done, total, errors, onDone) {
+        // Never apply deletions or complete a session after a failed transfer:
+        // the session stays resumable and the next run retries it.
+        if (errors > 0) {
+            androidSyncActive = false;
+            setProgressPulse(false);
+            updateSyncProgress(profileName, done, total, errors);
+            if (onDone) onDone(false);
+            return;
+        }
+
         var deletes = delta.to_delete || [];
         if (deletes.length === 0 || !isAndroid()) {
-            completeAndroidSync(sessionPath, done, total, errors);
+            completeAndroidSync(sessionPath, done, total, errors, onDone);
             return;
         }
 
         var i = 0;
+        var deleteErrors = 0;
+
         function next() {
             if (i >= deletes.length) {
-                completeAndroidSync(sessionPath, done, total, errors);
+                if (deleteErrors > 0) {
+                    androidSyncActive = false;
+                    setProgressPulse(false);
+                    updateSyncProgress(profileName, done, total, errors + deleteErrors);
+                    if (onDone) onDone(false);
+                    return;
+                }
+                completeAndroidSync(sessionPath, done, total, errors, onDone);
                 return;
             }
             var del = deletes[i++];
-            window.AndroidBridge.deleteFile(profileName + "/" + del.path, function (result) {
+            window.AndroidBridge.deleteFile(profileName + "/" + del.path, bridgeCallback(function (result) {
+                if (!result.success) deleteErrors++;
                 next();
-            });
+            }));
         }
         next();
     }
 
-    function completeAndroidSync(sessionPath, done, total, errors) {
+    function completeAndroidSync(sessionPath, done, total, errors, onDone) {
         fetch("/sync/complete", {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                "X-Presync-Token": token
+            },
+            body: JSON.stringify({ session: sessionPath })
+        }).then(function (res) {
+            return res.json().then(function (data) {
+                if (!res.ok) throw new Error(data.error || "complete failed");
+                return data;
+            });
+        }).then(function () {
+            androidSyncActive = false;
+            setProgressPulse(false);
+            updateSyncProgress("", done, total, errors);
+            if (onDone) onDone(true);
+        }).catch(function () {
+            androidSyncActive = false;
+            setProgressPulse(false);
+            if (onDone) onDone(false);
+        });
+    }
+
+    // --- Push (phone -> PC) ---
+
+    function pushToDevice(profileName, btn) {
+        btn.disabled = true;
+        btn.textContent = "Reading folder...";
+
+        window.AndroidBridge.pushBuildManifest(profileName, bridgeCallback(function (manifestRes) {
+            if (!manifestRes.success) {
+                btn.disabled = false;
+                btn.textContent = "Send to PC";
+                alert(manifestRes.data || "Could not read the upload folder");
+                return;
+            }
+
+            var manifest = { files: [] };
+            try {
+                manifest = JSON.parse(manifestRes.data);
+            } catch (e) {
+                manifest = { files: [] };
+            }
+
+            var deviceId = window.AndroidBridge.getDeviceId() || null;
+            if (!deviceId) {
+                api("GET", "/web/device-id").then(function (data) {
+                    deviceId = data.device_id;
+                    window.AndroidBridge.saveDeviceId(deviceId);
+                    startAndroidPush(profileName, btn, deviceId, manifest);
+                }).catch(function (err) {
+                    btn.disabled = false;
+                    btn.textContent = "Send to PC";
+                    alert(err.error || "Failed to get device ID");
+                });
+                return;
+            }
+
+            startAndroidPush(profileName, btn, deviceId, manifest);
+        }));
+    }
+
+    function startAndroidPush(profileName, btn, deviceId, sourceManifest) {
+        btn.textContent = "Starting...";
+
+        fetch("/push", {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                "X-Presync-Token": token
+            },
+            body: JSON.stringify({
+                device_id: deviceId,
+                profile: profileName,
+                source_manifest: sourceManifest
+            })
+        }).then(function (res) {
+            return res.json().then(function (data) {
+                if (!res.ok) return Promise.reject(data);
+                return data;
+            });
+        }).then(function (startResp) {
+            var files = startResp.files || [];
+
+            if (files.length === 0) {
+                completeAndroidPush(startResp.session, btn, profileName, 0, 0, 0);
+                alert("Already up to date");
+                return;
+            }
+
+            showProgressTab(true);
+            setProgressPulse(true);
+            androidSyncActive = true;
+            navigate("progress");
+            updateSyncProgress(profileName, 0, files.length, 0);
+
+            var done = 0;
+            var errors = 0;
+
+            function next() {
+                if (done + errors >= files.length) {
+                    finishAndroidPush(profileName, startResp.session, btn, done, files.length, errors);
+                    return;
+                }
+
+                var f = files[done + errors];
+                updateSyncProgress(profileName, done, files.length, errors);
+
+                uploadPushFile(profileName, startResp.session, f, function (ok) {
+                    if (ok) {
+                        done++;
+                    } else {
+                        errors++;
+                    }
+                    next();
+                });
+            }
+
+            next();
+        }).catch(function (err) {
+            btn.disabled = false;
+            btn.textContent = "Send to PC";
+            alert(err.error || "Failed to start upload");
+        });
+    }
+
+    function uploadPushFile(profileName, sessionPath, file, onDone) {
+        var attempt = 0;
+
+        function tryFrom(offset) {
+            attempt++;
+
+            uploadPushChunks(profileName, sessionPath, file.path, offset, function (ok) {
+                if (!ok) {
+                    retryOrFail();
+                    return;
+                }
+
+                confirmPushFile(profileName, sessionPath, file.path, function (confirmed) {
+                    if (confirmed) {
+                        onDone(true);
+                        return;
+                    }
+                    retryOrFail();
+                });
+            });
+        }
+
+        function retryOrFail() {
+            if (attempt >= 3) {
+                reportPushError(sessionPath, file.path);
+                onDone(false);
+                return;
+            }
+            fetchPushOffset(sessionPath, file.path, function (offset) {
+                setTimeout(function () {
+                    tryFrom(offset);
+                }, 1000);
+            });
+        }
+
+        tryFrom(file.offset || 0);
+    }
+
+    function uploadPushChunks(profileName, sessionPath, filePath, offset, onDone) {
+        var CHUNK_BYTES = 256 * 1024;
+
+        function readNext(at) {
+            window.AndroidBridge.pushReadChunk(profileName, filePath, at, CHUNK_BYTES, bridgeCallback(function (res) {
+                if (!res.success) {
+                    onDone(false);
+                    return;
+                }
+
+                var parsed;
+                try {
+                    parsed = JSON.parse(res.data);
+                } catch (e) {
+                    onDone(false);
+                    return;
+                }
+
+                var bytes;
+                try {
+                    bytes = base64ToBytes(parsed.data || "");
+                } catch (e) {
+                    onDone(false);
+                    return;
+                }
+
+                if (bytes.length === 0) {
+                    // An exact multiple-of-chunk file ends with a zero-length
+                    // read; that is a successful completion.
+                    onDone(!!parsed.eof);
+                    return;
+                }
+
+                var query = "?session=" + encodeURIComponent(sessionPath) +
+                    "&path=" + encodeURIComponent(filePath) +
+                    "&offset=" + at;
+
+                fetch("/push/file" + query, {
+                    method: "POST",
+                    headers: { "X-Presync-Token": token },
+                    body: bytes
+                }).then(function (res) {
+                    return res.json().then(function (body) {
+                        if (!res.ok) {
+                            if (res.status === 409 && body && typeof body.offset === "number") {
+                                return body;
+                            }
+                            return Promise.reject(body);
+                        }
+                        return body;
+                    });
+                }).then(function (body) {
+                    var next = body && typeof body.offset === "number" ? body.offset : at + bytes.length;
+                    if (parsed.eof) {
+                        onDone(true);
+                    } else {
+                        readNext(next);
+                    }
+                }).catch(function () {
+                    onDone(false);
+                });
+            }));
+        }
+
+        readNext(offset);
+    }
+
+    function confirmPushFile(profileName, sessionPath, filePath, onDone) {
+        window.AndroidBridge.pushHashFile(profileName, filePath, bridgeCallback(function (hashRes) {
+            if (!hashRes.success) {
+                onDone(false);
+                return;
+            }
+
+            var hash = null;
+            try {
+                hash = JSON.parse(hashRes.data).hash;
+            } catch (e) {
+                onDone(false);
+                return;
+            }
+            if (!hash) {
+                onDone(false);
+                return;
+            }
+
+            fetch("/push/confirm", {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                    "X-Presync-Token": token
+                },
+                body: JSON.stringify({
+                    session: sessionPath,
+                    path: filePath,
+                    sha256: hash
+                })
+            }).then(function (res) {
+                return res.json();
+            }).then(function (result) {
+                onDone(!!result.ok);
+            }).catch(function () {
+                onDone(false);
+            });
+        }));
+    }
+
+    function fetchPushOffset(sessionPath, filePath, onDone) {
+        fetch("/push/status?session=" + encodeURIComponent(sessionPath), {
+            headers: { "X-Presync-Token": token }
+        }).then(function (res) {
+            return res.json();
+        }).then(function (data) {
+            var files = data.files || [];
+            for (var i = 0; i < files.length; i++) {
+                if (files[i].path === filePath) {
+                    onDone(files[i].offset || 0);
+                    return;
+                }
+            }
+            onDone(0);
+        }).catch(function () {
+            onDone(0);
+        });
+    }
+
+    function reportPushError(sessionPath, filePath) {
+        fetch("/push/error", {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                "X-Presync-Token": token
+            },
+            body: JSON.stringify({ session: sessionPath, path: filePath })
+        }).catch(function () {
+            // Best effort — the session remains resumable either way.
+        });
+    }
+
+    function finishAndroidPush(profileName, sessionPath, btn, done, total, errors) {
+        if (errors > 0) {
+            androidSyncActive = false;
+            setProgressPulse(false);
+            updateSyncProgress(profileName, done, total, errors);
+            btn.disabled = false;
+            btn.textContent = "Send to PC";
+            return;
+        }
+        completeAndroidPush(sessionPath, btn, profileName, done, total, errors);
+    }
+
+    function completeAndroidPush(sessionPath, btn, profileName, done, total, errors) {
+        btn.disabled = false;
+        btn.textContent = "Send to PC";
+
+        fetch("/push/complete", {
             method: "POST",
             headers: {
                 "Content-Type": "application/json",
@@ -545,6 +1052,15 @@
             androidSyncActive = false;
             setProgressPulse(false);
         });
+    }
+
+    function base64ToBytes(base64) {
+        var binary = atob(base64);
+        var bytes = new Uint8Array(binary.length);
+        for (var i = 0; i < binary.length; i++) {
+            bytes[i] = binary.charCodeAt(i);
+        }
+        return bytes;
     }
 
     function updateSyncProgress(profileName, done, total, errors) {
@@ -673,22 +1189,40 @@
             var html = '<h1>Profiles</h1>';
             for (var i = 0; i < profiles.length; i++) {
                 var p = profiles[i];
+                var isPush = p.direction === "push";
+
                 html +=
                     '<div class="card">' +
-                    '<div class="card-title">' + esc(p.name) + "</div>" +
-                    '<div class="setting-row"><span class="setting-label">Source</span><span class="setting-value">' + esc(p.source) + "</span></div>";
-                if (isAndroid()) {
-                    if (androidBase) {
-                        html += '<div class="setting-row"><span class="setting-label">Destination</span><span class="setting-value">' + esc(androidBase + "/" + p.name) + "</span></div>";
+                    '<div class="card-title">' + esc(p.name) + "</div>";
+
+                if (isPush) {
+                    html += '<div class="setting-row"><span class="setting-label">Direction</span><span class="mode-badge">push</span></div>';
+                    if (isAndroid()) {
+                        var pushSource = window.AndroidBridge.getPushSourceDisplayPath(p.name) || "";
+                        if (pushSource) {
+                            html += '<div class="setting-row"><span class="setting-label">Upload folder</span><span class="setting-value">' + esc(pushSource) + "</span></div>";
+                        } else {
+                            html += '<div class="setting-row"><span class="setting-label">Upload folder</span><span class="setting-value" style="color:var(--status-warning)">No folder selected</span></div>';
+                        }
                     } else {
-                        html += '<div class="setting-row"><span class="setting-label">Destination</span><span class="setting-value" style="color:var(--status-warning)">No folder selected</span></div>';
+                        html += '<div class="setting-row"><span class="setting-label">Receive folder</span><span class="setting-value">' + esc(p.destination || "") + "</span></div>";
                     }
-                } else if (p.destinations) {
-                    var keys = Object.keys(p.destinations);
-                    for (var j = 0; j < keys.length; j++) {
-                        html += '<div class="setting-row"><span class="setting-label">Dest: ' + esc(keys[j]) + '</span><span class="setting-value">' + esc(p.destinations[keys[j]]) + "</span></div>";
+                } else {
+                    html += '<div class="setting-row"><span class="setting-label">Source</span><span class="setting-value">' + esc(p.source) + "</span></div>";
+                    if (isAndroid()) {
+                        if (androidBase) {
+                            html += '<div class="setting-row"><span class="setting-label">Destination</span><span class="setting-value">' + esc(androidBase + "/" + p.name) + "</span></div>";
+                        } else {
+                            html += '<div class="setting-row"><span class="setting-label">Destination</span><span class="setting-value" style="color:var(--status-warning)">No folder selected</span></div>';
+                        }
+                    } else if (p.destinations) {
+                        var keys = Object.keys(p.destinations);
+                        for (var j = 0; j < keys.length; j++) {
+                            html += '<div class="setting-row"><span class="setting-label">Dest: ' + esc(keys[j]) + '</span><span class="setting-value">' + esc(p.destinations[keys[j]]) + "</span></div>";
+                        }
                     }
                 }
+
                 html +=
                     '<div class="setting-row"><span class="setting-label">Mode</span><span class="mode-badge">' + esc(p.mode) + "</span></div>" +
                     "</div>";

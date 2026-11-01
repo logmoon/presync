@@ -17,6 +17,9 @@ const (
 	pidFileName     = "presync.pid"
 	logDirName      = "logs"
 	logFileName     = "presync.log"
+
+	DirectionPull = "pull"
+	DirectionPush = "push"
 )
 
 type Config struct {
@@ -30,11 +33,14 @@ type DaemonConfig struct {
 }
 
 type Profile struct {
-	Name         string            `toml:"name"`
-	Source       string            `toml:"source"`
+	Name        string `toml:"name"`
+	Source      string `toml:"source"`
+	Direction   string `toml:"direction"`   // "pull" (default) or "push"
+	Destination string `toml:"destination"` // push only: server-side receive folder
+	Mode        string `toml:"mode"`
+	AutoSync    *bool  `toml:"auto_sync"`
+
 	Destinations map[string]string `toml:"destinations"`
-	Mode         string            `toml:"mode"`
-	AutoSync     *bool             `toml:"auto_sync"`
 }
 
 func defaults() Config {
@@ -95,6 +101,8 @@ func Load() (Config, error) {
 		return Config{}, fmt.Errorf("parsing %s: %w", path, err)
 	}
 
+	normalize(&cfg)
+
 	if err := validate(cfg); err != nil {
 		return Config{}, err
 	}
@@ -102,7 +110,17 @@ func Load() (Config, error) {
 	return cfg, nil
 }
 
+func normalize(cfg *Config) {
+	for i := range cfg.Profiles {
+		if cfg.Profiles[i].Direction == "" {
+			cfg.Profiles[i].Direction = DirectionPull
+		}
+	}
+}
+
 func SaveConfig(cfg Config) error {
+	normalize(&cfg)
+
 	if err := validate(cfg); err != nil {
 		return err
 	}
@@ -148,6 +166,22 @@ func validate(cfg Config) error {
 	for _, p := range cfg.Profiles {
 		if p.Mode != "mirror" && p.Mode != "additive" {
 			return fmt.Errorf("profile %q has invalid mode %q: must be mirror or additive", p.Name, p.Mode)
+		}
+
+		switch p.Direction {
+		case DirectionPull:
+			if p.Destination != "" {
+				return fmt.Errorf("profile %q: destination is only valid for push profiles (use destinations for pull)", p.Name)
+			}
+		case DirectionPush:
+			if p.Destination == "" {
+				return fmt.Errorf("profile %q: push profiles require a destination folder", p.Name)
+			}
+			if len(p.Destinations) > 0 {
+				return fmt.Errorf("profile %q: push profiles use destination, not destinations", p.Name)
+			}
+		default:
+			return fmt.Errorf("profile %q has invalid direction %q: must be pull or push", p.Name, p.Direction)
 		}
 
 		// Profile names flow into session filenames and CLI/UI filters — they

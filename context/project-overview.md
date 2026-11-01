@@ -44,12 +44,20 @@ presync connect | connect <address> | status | forget
 4. Server computes the delta (add / update / delete-if-mirror) and the transfer begins, file by file, with checksum verification and resumability.
 5. Client and UI report completion; session state is cleared once every file reaches `done`.
 
+**Push (optional, phone → PC)**
+1. A profile configured with `direction = "push"` names the phone's folder as its source and a server folder as `destination`.
+2. From the phone, the user picks that source folder once, then taps "Send to PC".
+3. The phone reports its source manifest; the server computes the delta against the destination and replies with only the files it needs.
+4. The phone uploads those files in chunks; the server writes `.presync-tmp`, verifies SHA-256, and atomically renames into place.
+5. In `additive` mode the server only ever gains files. In `mirror` mode, deletions are applied only after a successful complete, and an empty source is refused when the destination has files.
+
 ## Features In Scope
 
 - Single Go binary acting as server and client on Linux, Mac, Windows
 - Minimal Android APK (WebView + SAF bridge) as the mobile client
 - QR + PIN device pairing with long-lived token trust store, and device unpairing
 - Multiple named sync profiles, each with its own source, destination, and mode
+- One-way profile directions: `pull` (server → client, default) and `push` (paired client → server), each with `mirror` or `additive` deletion rules
 - `mirror` mode (recipient matches server exactly, deletions propagate) and `additive` mode (recipient only ever gains files)
 - File diff engine using size + mtime, falling back to SHA-256 only when those differ
 - Chunked file transfer over HTTP with end-to-end SHA-256 verification and automatic retry (up to 3 attempts) on mismatch
@@ -64,7 +72,7 @@ presync connect | connect <address> | status | forget
 
 ## Features Out of Scope
 
-- **Bidirectional sync** — the server is always master; clients never push changes back, only manifests of what they currently have. There is no conflict resolution because conflicts can't occur.
+- **Bidirectional sync** — each profile has exactly one writer: pull profiles are written by the server, push profiles by the paired client that owns their source. No profile merges changes from both sides, so there is no conflict resolution.
 - **Cloud relay or sync over the internet** — presync only ever operates on the local network. There is no remote server, no NAT traversal, no off-LAN access.
 - **iOS support** — Android is the only mobile target; no iOS app is planned.
 - **Real-time / continuous file watching** — sync is triggered manually, on a schedule, or on network-detect (Phase 2 auto-sync), not via filesystem watchers reacting to every change.
@@ -81,6 +89,7 @@ A single technical user managing sync between their own personal devices — for
 - Killing the connection mid-transfer and reconnecting resumes correctly: completed files are not re-sent, the in-progress file resumes from its existing byte count, and no corrupted or half-written file is ever left at its real filename.
 - Pairing a new device requires the QR + PIN confirmation exactly once; every sync after that requires no manual confirmation.
 - `mirror` mode deletes recipient files that were removed at the source; `additive` mode never deletes anything on the recipient, even when the source file is gone.
+- A push profile uploads only changed files from the phone, verifies every file's SHA-256 on the server, and never deletes server files before a successful complete.
 - The same binary, built once per OS, runs correctly as both `presync start` (server) and `presync connect` (client) on Linux, Mac, and Windows.
 - The Android APK installs via sideload (no Play Store) and can write into a user-selected SAF folder without requesting broad storage permissions.
 - `presync unpair` immediately invalidates a device's token — a subsequent sync attempt from that device is rejected.

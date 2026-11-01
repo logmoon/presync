@@ -85,6 +85,13 @@ func (s *Session) Resume(ctx context.Context) error {
 - Transfer-layer checksum mismatches are not treated as fatal errors — they trigger the documented retry-then-mark-error flow (see architecture.md invariant 2), not an exception path.
 - The user-facing surface (CLI output, web UI) always shows a specific, actionable message — never a bare "an error occurred."
 
+## Testing
+
+- Unit tests use Go's standard `testing` package, table-driven, in `*_test.go` files beside the code. Run `go test ./...` for every change.
+- E2E integration lives in `scripts/test-pairing.sh`, `scripts/test-transfer.sh`, `scripts/test-connect.sh`, and `scripts/test-push.sh`; each runs against a live daemon with a temp `PRESYNC_CONFIG_DIR`. Run the script covering the area you changed.
+- Every auth, sync-session, config-validation, or transfer change gets a unit test. Pairing, connect, push, and cross-device changes extend the matching E2E script.
+- Android bridge changes must build with `android/gradlew assembleDebug` before review.
+
 ## Environment Variables
 
 presync is config-file driven, not environment-variable driven, by design (matches the "no cloud, no accounts, just a config file" philosophy). The only variables used:

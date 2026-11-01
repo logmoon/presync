@@ -121,6 +121,9 @@ Last updated: 2026-06-21
 | Padding          | `var(--space-1) var(--space-2)` (4px 8px) |
 | Border radius    | `var(--radius-input)` (6px)    |
 
+**Pattern notes:**
+Also used as the direction badge on push profile cards (label `push`), alongside the mode badge. Pull remains the unlabelled default.
+
 ### Empty State
 
 | Property         | Value                          |

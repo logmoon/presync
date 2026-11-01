@@ -120,6 +120,9 @@ func handlePairConfirm() http.HandlerFunc {
 
 		if len(destinations) > 0 {
 			for i := range cfg.Profiles {
+				if cfg.Profiles[i].Direction == config.DirectionPush {
+					continue
+				}
 				if cfg.Profiles[i].Destinations == nil {
 					cfg.Profiles[i].Destinations = make(map[string]string)
 				}
@@ -147,6 +150,9 @@ func handlePairConfirm() http.HandlerFunc {
 			// No server-side destinations — remove any stale entry for this device
 			changed := false
 			for i := range cfg.Profiles {
+				if cfg.Profiles[i].Direction == config.DirectionPush {
+					continue
+				}
 				if cfg.Profiles[i].Destinations != nil {
 					if _, ok := cfg.Profiles[i].Destinations[deviceID]; ok {
 						delete(cfg.Profiles[i].Destinations, deviceID)

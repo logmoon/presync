@@ -39,6 +39,7 @@ type fileInfo struct {
 	Path   string `json:"path"`
 	Size   int64  `json:"size"`
 	SHA256 string `json:"sha256,omitempty"`
+	State  string `json:"state,omitempty"`
 }
 
 type syncConfirmResponse struct {
@@ -100,8 +101,18 @@ func SyncProfile(serverAddr, token, profileName, deviceID, destDir string, fresh
 	result := SyncResult{}
 
 	for _, f := range startResp.Files {
-		// Files with a SHA256 from the server are either already done (resume)
-		// or size+mtime-ambiguous files needing verification (fresh).
+		// Files already completed in a resumed session need neither a hash nor
+		// a transfer — the server verified them before marking them done.
+		if f.State == string(transfer.FileDone) {
+			result.FilesSynced++
+			if progress != nil {
+				progress(f.Path, true, nil)
+			}
+			continue
+		}
+
+		// Files with a SHA256 from the server are size+mtime-ambiguous files
+		// needing verification against the local copy (fresh sessions).
 		if f.SHA256 != "" {
 			ok, err := verifyOrConfirm(c, serverAddr, token, sessionPath, f.Path, destDir, f.SHA256)
 			if err != nil {
@@ -141,8 +152,15 @@ func SyncProfile(serverAddr, token, profileName, deviceID, destDir string, fresh
 		}
 	}
 
-	// Mirror-mode deletions: applied only after the file phase, when the full
-	// delta is known. The server only populates ToDelete for mirror profiles.
+	// A session with failed files is left resumable: no deletions, no
+	// complete. The next run picks up where this one stopped.
+	if result.Errors > 0 {
+		return result, nil
+	}
+
+	// Mirror-mode deletions: applied only after the file phase succeeds, when
+	// the full delta is known. The server only populates ToDelete for mirror
+	// profiles.
 	for _, del := range startResp.Delta.ToDelete {
 		if err := os.Remove(filepath.Join(destDir, del.Path)); err != nil && !os.IsNotExist(err) {
 			logWarning := fmt.Sprintf("deleting %s: %v", del.Path, err)

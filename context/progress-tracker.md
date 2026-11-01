@@ -3,8 +3,26 @@
 ## Current Status
 
 **Phase:** Phase 2 — Polish
-**Last completed:** Security hardening + sync engine overhaul (review fixes)
-**Next:** 12 Auto-sync on same network (still the next planned task)
+**Last completed:** Android pull restoration + push profiles (client → server), review fixes, clean builds
+**Next:** Manual end-to-end device test (pull + push), then Task 12 auto-sync
+
+---
+
+## In Progress
+
+None — manual device testing is next.
+
+## Up Next
+
+- Manual end-to-end test: pair, pull, push, resume, mirror deletion
+- 12 Auto-sync on same network
+- 13 mDNS discovery
+- 14 Sync history / logs in UI
+- 15 Cross-compile client binaries
+
+## Blocked
+
+None.
 
 ---
 
@@ -26,6 +44,8 @@
 
 - [x] 10 Multiple profiles
 - [x] 11 Per-profile sync modes (mirror / additive)
+- [x] 11A Push profiles (client → server)
+- [ ] Manual end-to-end device test (pull + push)
 - [ ] 12 Auto-sync on same network
 - [ ] 13 mDNS discovery
 - [ ] 14 Sync history / logs in UI
@@ -88,6 +108,16 @@ _Add decisions here as they are made during implementation._
 - **Unpair cleanup** (Phase 4): removes destination entries (ID + name keys) and deletes the device's session files.
 - **SaveConfig validates** (Phase 4): mode/port/log-level/empty/duplicate/path-unsafe profile names rejected before write; pair confirm reloads config from disk before mutating (no stale in-memory clobber).
 - **Device IDs 8 bytes** (Phase 4): 16 hex chars, collision-checked on add.
+- **Android pull restored**: SafBridge implements the full chunked contract (`buildManifest`, `hashFile`, `tempFileSize`, `writeChunk`, `finishFile`, `renameFile`, `abortFile`, `deleteFile`). Done files are skipped via a new `state` field instead of re-hashed; ambiguous files are verified natively.
+- **Push profiles** (Phase 5): `direction = "pull" | "push"`, push `destination`; separate `/push*` API; server-owned offsets and temp files; client-hash + server-hash verification before atomic rename; additive/mirror parity. Mirror deletes are persisted in the session and applied only on successful complete; empty source is refused when the destination has files.
+- **Push resume merges**: a resumed push session accepts newly added source files, drops files deleted from the source, and refreshes expected sizes.
+- **Push profile binding**: push profiles are excluded from `/profiles` (pull discovery), `presync pair --dest`, and `presync sync`; a pull profile can never be pushed and vice versa.
+- **Bridge callbacks are names**: `web/app.js` registers global callbacks via `bridgeCallback()` and passes the name; Android receives a string, never an inline function.
+- **Resume reconciliation** (both directions): the session is reconciled against the fresh delta on start — changed/missing done files re-queue, new files are added, removed source files are dropped.
+- **Completion deletes the resolved session path**: handlers use `sess.Path`, never the raw client-supplied identifier.
+- **Manifest paths are slash-normalized**: `diff.BuildManifest` uses `filepath.ToSlash`, keeping Windows/Android/push manifests comparable.
+- **Deletion ordering**: pull clients and Android skip mirror deletions and completion when any file failed; the session stays resumable. Push mirror deletes only after every upload is verified and complete succeeds.
+- **Push path safety**: containment is checked lexically and against resolved symlinks; symlinked temp files are rejected.
 
 ---
 

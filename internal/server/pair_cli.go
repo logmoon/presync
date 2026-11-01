@@ -57,6 +57,9 @@ func Pair(name, dest string) error {
 	if dest != "" {
 		destinations = make(map[string]string)
 		for _, p := range cfg.Profiles {
+			if p.Direction == config.DirectionPush {
+				continue
+			}
 			destinations[p.Name] = filepath.Join(dest, p.Name)
 		}
 	}

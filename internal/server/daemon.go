@@ -314,6 +314,14 @@ func newServer(cfg *config.Config) *http.Server {
 	mux.HandleFunc("/sync/status", withAuth(handleSyncStatus()))
 	mux.HandleFunc("/sync/complete", withAuth(handleSyncComplete()))
 
+	// Push (client -> server) routes
+	mux.HandleFunc("/push", withAuth(handlePushStart()))
+	mux.HandleFunc("/push/file", withAuth(handlePushFile()))
+	mux.HandleFunc("/push/confirm", withAuth(handlePushConfirm()))
+	mux.HandleFunc("/push/error", withAuth(handlePushError()))
+	mux.HandleFunc("/push/status", withAuth(handlePushStatus()))
+	mux.HandleFunc("/push/complete", withAuth(handlePushComplete()))
+
 	// Static file serving (must be last — catch-all route)
 	mux.Handle("/", staticFileHandler("web"))
 

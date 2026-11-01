@@ -354,3 +354,91 @@ func TestDeleteSession(t *testing.T) {
 		t.Errorf("deleting nonexistent should not error: %v", err)
 	}
 }
+
+func TestSessionDirectionRoundtrip(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("PRESYNC_CONFIG_DIR", dir)
+	if err := os.MkdirAll(filepath.Join(dir, "sessions"), 0o755); err != nil {
+		t.Fatalf("creating sessions dir: %v", err)
+	}
+
+	sess := NewSessionWithDirection("dev-push", "PhoneMusic", config.DirectionPush, []string{"a.mp3"})
+	sess.SetPlannedDeletes([]string{"gone.mp3"})
+	sess.SetFileSize("a.mp3", 1234)
+	if err := sess.Save(); err != nil {
+		t.Fatalf("saving session: %v", err)
+	}
+
+	loaded, err := LoadSession(sess.Path)
+	if err != nil {
+		t.Fatalf("loading session: %v", err)
+	}
+	if loaded.Direction != config.DirectionPush {
+		t.Errorf("direction: got %q, want %q", loaded.Direction, config.DirectionPush)
+	}
+	if loaded.Files[0].Size != 1234 {
+		t.Errorf("size: got %d, want 1234", loaded.Files[0].Size)
+	}
+	deletes := loaded.PlannedDeletes()
+	if len(deletes) != 1 || deletes[0] != "gone.mp3" {
+		t.Errorf("planned deletes: got %v", deletes)
+	}
+}
+
+func TestFindSessionForDeviceDirection(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("PRESYNC_CONFIG_DIR", dir)
+	if err := os.MkdirAll(filepath.Join(dir, "sessions"), 0o755); err != nil {
+		t.Fatalf("creating sessions dir: %v", err)
+	}
+
+	sess := NewSessionWithDirection("dev1", "p", config.DirectionPush, []string{"a"})
+	if err := sess.Save(); err != nil {
+		t.Fatalf("saving session: %v", err)
+	}
+
+	found, err := FindSessionForDeviceDirection("dev1", "p", config.DirectionPush)
+	if err != nil || found == nil {
+		t.Fatalf("expected push session, err=%v found=%v", err, found)
+	}
+	found, err = FindSessionForDeviceDirection("dev1", "p", config.DirectionPull)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if found != nil {
+		t.Error("did not expect a pull session")
+	}
+}
+
+func TestRemoveFile(t *testing.T) {
+	sess := NewSession("dev1", "p", []string{"a", "b", "c"})
+	sess.RemoveFile("b")
+
+	if len(sess.Files) != 2 || sess.Files[0].Path != "a" || sess.Files[1].Path != "c" {
+		t.Fatalf("unexpected files after remove: %+v", sess.Files)
+	}
+}
+
+func TestUpsertFileResetsState(t *testing.T) {
+	sess := NewSession("dev1", "p", []string{"a"})
+	sess.MarkDone("a", "deadbeef")
+	sess.UpdateOffset("a", 12)
+	sess.Files[0].Attempts = 2
+
+	sess.UpsertFile("a", 42)
+	f := sess.GetFile("a")
+	if f.State != FilePending {
+		t.Errorf("state: got %q, want pending", f.State)
+	}
+	if f.Offset != 0 || f.Attempts != 0 || f.SHA256 != "" {
+		t.Errorf("stale fields not cleared: %+v", f)
+	}
+	if f.Size != 42 {
+		t.Errorf("size: got %d, want 42", f.Size)
+	}
+
+	sess.UpsertFile("b", 7)
+	if len(sess.Files) != 2 || sess.Files[1].Path != "b" || sess.Files[1].State != FilePending {
+		t.Fatalf("missing file not appended: %+v", sess.Files)
+	}
+}

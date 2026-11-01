@@ -119,16 +119,28 @@ func runSync() error {
 	var profiles []config.Profile
 	if profileName != "" {
 		for _, p := range cfg.Profiles {
-			if p.Name == profileName {
-				profiles = append(profiles, p)
-				break
+			if p.Name != profileName {
+				continue
 			}
+			if p.Direction == config.DirectionPush {
+				return fmt.Errorf("profile %q is a push profile — run it from the paired device", profileName)
+			}
+			profiles = append(profiles, p)
+			break
 		}
 		if len(profiles) == 0 {
 			return fmt.Errorf("profile %q not found in config.toml", profileName)
 		}
 	} else {
-		profiles = cfg.Profiles
+		for _, p := range cfg.Profiles {
+			if p.Direction == config.DirectionPush {
+				continue
+			}
+			profiles = append(profiles, p)
+		}
+		if len(profiles) == 0 {
+			return fmt.Errorf("no pull profiles configured in config.toml")
+		}
 	}
 
 	deviceID := "local"

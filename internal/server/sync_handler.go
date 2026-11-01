@@ -32,6 +32,9 @@ type fileInfo struct {
 	Path   string `json:"path"`
 	Size   int64  `json:"size"`
 	SHA256 string `json:"sha256,omitempty"`
+	// State is set for files carried over from an existing session. Clients
+	// may skip "done" files without re-hashing or re-fetching them.
+	State string `json:"state,omitempty"`
 }
 
 type syncConfirmRequest struct {
@@ -103,6 +106,10 @@ func handleSyncStart() http.HandlerFunc {
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": fmt.Sprintf("profile %q not found", req.Profile)})
 			return
 		}
+		if profile.Direction == config.DirectionPush {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": fmt.Sprintf("profile %q is push-only", req.Profile)})
+			return
+		}
 
 		// Look up device name from devices.json to resolve destination
 		var deviceName string
@@ -143,7 +150,7 @@ func handleSyncStart() http.HandlerFunc {
 			}
 		}
 
-		existing, err := transfer.FindSessionForDevice(req.DeviceID, req.Profile)
+		existing, err := transfer.FindSessionForDeviceDirection(req.DeviceID, req.Profile, config.DirectionPull)
 		if err != nil {
 			logError("finding existing session: %v", err)
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to check existing session"})
@@ -176,14 +183,42 @@ func handleSyncStart() http.HandlerFunc {
 		}
 
 		if sess != nil {
-			// Resume: the session file list is authoritative for what remains,
-			// but the delta is recomputed so the client still receives
-			// mirror-mode deletions for files it has since accumulated.
+			// Resume: reconcile the session with the freshly computed delta.
+			// A file marked done in the session but missing/changed at the
+			// destination must be transferred again; new source files that
+			// appeared during the pause are added; files removed from the
+			// source are dropped.
+			srcIndex := manifestIndex(sourceManifest)
+			for _, a := range delta.ToAdd {
+				if f, ok := srcIndex[a.Path]; ok {
+					sess.UpsertFile(a.Path, f.Size)
+				}
+			}
+			for _, a := range delta.ToUpdate {
+				if f, ok := srcIndex[a.Path]; ok {
+					sess.UpsertFile(a.Path, f.Size)
+				}
+			}
+
+			var dropped []string
+			for _, fs := range sess.Files {
+				if _, ok := srcIndex[fs.Path]; !ok {
+					dropped = append(dropped, fs.Path)
+				}
+			}
+			for _, path := range dropped {
+				sess.RemoveFile(path)
+			}
+			if err := sess.Save(); err != nil {
+				logError("saving reconciled session: %v", err)
+			}
+
 			var files []fileInfo
 			for _, fs := range sess.Files {
 				files = append(files, fileInfo{
 					Path:   fs.Path,
 					SHA256: fs.SHA256,
+					State:  string(fs.State),
 				})
 			}
 
@@ -302,6 +337,10 @@ func handleSyncFile() http.HandlerFunc {
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
 			return
 		}
+		if sess.Direction != config.DirectionPull {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "not a pull session"})
+			return
+		}
 
 		fs := sess.GetFile(filePath)
 		if fs == nil {
@@ -408,6 +447,10 @@ func handleSyncConfirm() http.HandlerFunc {
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
 			return
 		}
+		if sess.Direction != config.DirectionPull {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "not a pull session"})
+			return
+		}
 
 		fs := sess.GetFile(req.Path)
 		if fs == nil {
@@ -475,6 +518,10 @@ func handleSyncStatus() http.HandlerFunc {
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
 			return
 		}
+		if sess.Direction != config.DirectionPull {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "not a pull session"})
+			return
+		}
 
 		var done, errors int
 		var current string
@@ -534,13 +581,19 @@ func handleSyncComplete() http.HandlerFunc {
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
 			return
 		}
+		if sess.Direction != config.DirectionPull {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "not a pull session"})
+			return
+		}
 
 		if !sess.IsComplete() {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "session not all files completed"})
 			return
 		}
 
-		if err := transfer.DeleteSession(req.Session); err != nil {
+		// Delete the resolved path, not the client-supplied identifier: a
+		// client may send only the basename.
+		if err := transfer.DeleteSession(sess.Path); err != nil {
 			logError("deleting session: %v", err)
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to delete session"})
 			return
@@ -575,6 +628,10 @@ func handleSyncError() http.HandlerFunc {
 		sess, err := resolveAndLoadSession(req.Session)
 		if err != nil {
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+			return
+		}
+		if sess.Direction != config.DirectionPull {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "not a pull session"})
 			return
 		}
 

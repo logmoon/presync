@@ -15,9 +15,13 @@ func handleProfiles() http.HandlerFunc {
 
 		cfg := getConfig()
 
-		names := make([]string, len(cfg.Profiles))
-		for i, p := range cfg.Profiles {
-			names[i] = p.Name
+		// Pull clients can only consume pull profiles; push profiles are
+		// driven from the paired device that owns their source.
+		names := []string{}
+		for _, p := range cfg.Profiles {
+			if p.Direction == config.DirectionPull {
+				names = append(names, p.Name)
+			}
 		}
 
 		writeJSON(w, http.StatusOK, map[string]interface{}{

@@ -34,12 +34,16 @@ type FileSession struct {
 	Offset   int64     `json:"offset"`
 	Attempts int       `json:"attempts"`
 	SHA256   string    `json:"sha256,omitempty"`
+	// Size is the expected source size for push transfers. Zero for pull.
+	Size int64 `json:"size,omitempty"`
 }
 
 type Session struct {
 	DeviceID    string        `json:"device_id"`
 	Profile     string        `json:"profile"`
+	Direction   string        `json:"direction"`
 	Files       []FileSession `json:"files"`
+	ToDelete    []string      `json:"to_delete,omitempty"`
 	CreatedAt   time.Time     `json:"created_at"`
 	LastUpdated time.Time     `json:"last_updated"`
 	Path        string        `json:"-"`
@@ -49,12 +53,18 @@ type Session struct {
 type sessionFile struct {
 	DeviceID    string        `json:"device_id"`
 	Profile     string        `json:"profile"`
+	Direction   string        `json:"direction,omitempty"`
 	Files       []FileSession `json:"files"`
+	ToDelete    []string      `json:"to_delete,omitempty"`
 	CreatedAt   time.Time     `json:"created_at"`
 	LastUpdated time.Time     `json:"last_updated"`
 }
 
 func NewSession(deviceID, profile string, filePaths []string) *Session {
+	return NewSessionWithDirection(deviceID, profile, config.DirectionPull, filePaths)
+}
+
+func NewSessionWithDirection(deviceID, profile, direction string, filePaths []string) *Session {
 	files := make([]FileSession, len(filePaths))
 	for i, p := range filePaths {
 		files[i] = FileSession{
@@ -67,6 +77,7 @@ func NewSession(deviceID, profile string, filePaths []string) *Session {
 	return &Session{
 		DeviceID:    deviceID,
 		Profile:     profile,
+		Direction:   direction,
 		Files:       files,
 		CreatedAt:   now,
 		LastUpdated: now,
@@ -114,10 +125,17 @@ func LoadSession(path string) (*Session, error) {
 		return nil, fmt.Errorf("parsing session file: %w", err)
 	}
 
+	direction := sf.Direction
+	if direction == "" {
+		direction = config.DirectionPull
+	}
+
 	return &Session{
 		DeviceID:    sf.DeviceID,
 		Profile:     sf.Profile,
+		Direction:   direction,
 		Files:       sf.Files,
+		ToDelete:    sf.ToDelete,
 		CreatedAt:   sf.CreatedAt,
 		LastUpdated: sf.LastUpdated,
 		Path:        path,
@@ -133,7 +151,9 @@ func (s *Session) Save() error {
 	sf := sessionFile{
 		DeviceID:    s.DeviceID,
 		Profile:     s.Profile,
+		Direction:   s.Direction,
 		Files:       s.Files,
+		ToDelete:    s.ToDelete,
 		CreatedAt:   s.CreatedAt,
 		LastUpdated: s.LastUpdated,
 	}
@@ -207,6 +227,71 @@ func (s *Session) UpdateOffset(path string, offset int64) {
 			return
 		}
 	}
+}
+
+func (s *Session) RemoveFile(path string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	filtered := make([]FileSession, 0, len(s.Files))
+	for _, f := range s.Files {
+		if f.Path != path {
+			filtered = append(filtered, f)
+		}
+	}
+	s.Files = filtered
+}
+
+// UpsertFile marks a file that the current delta says must be uploaded. It adds
+// the file when missing, and resets any prior state (including a stale done
+// entry whose destination was removed or changed) so the upload happens again.
+func (s *Session) UpsertFile(path string, size int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for i := range s.Files {
+		if s.Files[i].Path != path {
+			continue
+		}
+		s.Files[i].State = FilePending
+		s.Files[i].Offset = 0
+		s.Files[i].Attempts = 0
+		s.Files[i].SHA256 = ""
+		s.Files[i].Size = size
+		return
+	}
+
+	s.Files = append(s.Files, FileSession{
+		Path:  path,
+		State: FilePending,
+		Size:  size,
+	})
+}
+
+func (s *Session) SetFileSize(path string, size int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for i := range s.Files {
+		if s.Files[i].Path == path {
+			s.Files[i].Size = size
+			return
+		}
+	}
+}
+
+func (s *Session) SetPlannedDeletes(paths []string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.ToDelete = paths
+}
+
+func (s *Session) PlannedDeletes() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	result := make([]string, len(s.ToDelete))
+	copy(result, s.ToDelete)
+	return result
 }
 
 func (s *Session) PendingFiles() []FileSession {
@@ -312,6 +397,20 @@ func FindSessionForDevice(deviceID, profile string) (*Session, error) {
 	latest := matches[len(matches)-1]
 
 	return LoadSession(latest)
+}
+
+// FindSessionForDeviceDirection returns the newest session for a device+profile
+// only when it matches the requested direction. Sessions created before the
+// direction field existed are treated as pull sessions.
+func FindSessionForDeviceDirection(deviceID, profile, direction string) (*Session, error) {
+	sess, err := FindSessionForDevice(deviceID, profile)
+	if err != nil || sess == nil {
+		return sess, err
+	}
+	if sess.Direction != direction {
+		return nil, nil
+	}
+	return sess, nil
 }
 
 func PruneStaleSessions() error {

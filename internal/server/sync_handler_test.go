@@ -217,3 +217,117 @@ func TestHandleSyncError_MarksFileError(t *testing.T) {
 		t.Errorf("expected error state after %d attempts, got %q", transfer.MaxRetries, reloaded.Files[0].State)
 	}
 }
+
+func TestHandleSyncStart_ResumeReportsDoneState(t *testing.T) {
+	_, srcDir := setupSyncHandlerTest(t, map[string]string{
+		"a.txt": "hello",
+		"b.txt": "world",
+	})
+
+	hash, err := transfer.ComputeFileHash(filepath.Join(srcDir, "a.txt"))
+	if err != nil {
+		t.Fatalf("hashing source: %v", err)
+	}
+
+	sess := transfer.NewSession("dev1", "music", []string{"a.txt", "b.txt"})
+	sess.MarkDone("a.txt", hash)
+	if err := sess.Save(); err != nil {
+		t.Fatalf("saving session: %v", err)
+	}
+
+	// The client still has a.txt at the destination, so it is not in the
+	// delta and must remain done. b.txt is missing, so it stays pending.
+	srcManifest, err := diff.BuildManifest(srcDir)
+	if err != nil {
+		t.Fatalf("building source manifest: %v", err)
+	}
+	var dstFiles []diff.FileEntry
+	for _, f := range srcManifest.Files {
+		if f.Path == "a.txt" {
+			dstFiles = append(dstFiles, f)
+		}
+	}
+
+	body, _ := json.Marshal(map[string]interface{}{
+		"device_id":            "dev1",
+		"profile":              "music",
+		"destination_manifest": diff.Manifest{Files: dstFiles},
+	})
+
+	handler := handleSyncStart()
+	req := httptest.NewRequest(http.MethodPost, "/sync", bytes.NewReader(body))
+	w := httptest.NewRecorder()
+	handler(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp syncStartResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decoding response: %v", err)
+	}
+
+	states := make(map[string]string, len(resp.Files))
+	for _, f := range resp.Files {
+		states[f.Path] = f.State
+	}
+	if states["a.txt"] != string(transfer.FileDone) {
+		t.Errorf("expected a.txt state done, got %q", states["a.txt"])
+	}
+	if states["b.txt"] != string(transfer.FilePending) {
+		t.Errorf("expected b.txt state pending, got %q", states["b.txt"])
+	}
+}
+
+func TestHandleSyncStart_ResumeRequeuesDoneFileMissingAtDestination(t *testing.T) {
+	_, srcDir := setupSyncHandlerTest(t, map[string]string{"a.txt": "hello", "b.txt": "world"})
+
+	hash, err := transfer.ComputeFileHash(filepath.Join(srcDir, "a.txt"))
+	if err != nil {
+		t.Fatalf("hashing source: %v", err)
+	}
+
+	// b.txt keeps the session incomplete so the resume path is used.
+	sess := transfer.NewSession("dev1", "music", []string{"a.txt", "b.txt"})
+	sess.MarkDone("a.txt", hash)
+	if err := sess.Save(); err != nil {
+		t.Fatalf("saving session: %v", err)
+	}
+
+	// The client reports an empty destination: the done entry must be
+	// re-queued rather than reported as already complete.
+	body, _ := json.Marshal(map[string]interface{}{
+		"device_id":            "dev1",
+		"profile":              "music",
+		"destination_manifest": diff.Manifest{},
+	})
+	req := httptest.NewRequest(http.MethodPost, "/sync", bytes.NewReader(body))
+	w := httptest.NewRecorder()
+	handleSyncStart()(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp syncStartResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decoding response: %v", err)
+	}
+	var found bool
+	for _, f := range resp.Files {
+		if f.Path != "a.txt" {
+			continue
+		}
+		found = true
+		if f.State != string(transfer.FilePending) {
+			t.Errorf("expected a.txt pending, got %q", f.State)
+		}
+		if f.SHA256 != "" {
+			t.Errorf("expected stale done hash cleared, got %q", f.SHA256)
+		}
+	}
+	if !found {
+		t.Fatalf("a.txt missing from response: %+v", resp.Files)
+	}
+}

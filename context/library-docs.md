@@ -103,11 +103,13 @@ type Config struct {
 }
 
 type Profile struct {
-    Name        string `toml:"name"`
-    Source      string `toml:"source"`
-    Destination string `toml:"destination"`
-    Mode        string `toml:"mode"` // "mirror" | "additive"
-    AutoSync    *bool  `toml:"auto_sync"` // pointer so "unset" is distinguishable from "false", to allow per-profile override of the daemon-level default
+    Name         string            `toml:"name"`
+    Source       string            `toml:"source"`
+    Direction    string            `toml:"direction"`   // "pull" (default) | "push"
+    Destination  string            `toml:"destination"` // push only: server-side receive folder
+    Destinations map[string]string `toml:"destinations"` // pull only, keyed by device ID
+    Mode         string            `toml:"mode"`        // "mirror" | "additive"
+    AutoSync     *bool             `toml:"auto_sync"`   // pointer so "unset" is distinguishable from "false", to allow per-profile override of the daemon-level default
 }
 ```
 
@@ -115,6 +117,8 @@ type Profile struct {
 - `AutoSync` must be a pointer (`*bool`) specifically so an unset value in a profile correctly falls back to `daemon.auto_sync` rather than defaulting to `false`.
 - Config is read once at daemon start; a config change requires a restart in Phase 1 (hot-reload is not in scope).
 - `Mode` is validated against the literal set `{"mirror", "additive"}` at load time — an unrecognized value is a startup error, not a silent default.
+- `Direction` defaults to `pull` when omitted. Push profiles require `destination` and reject `destinations`; pull profiles reject `destination`. These cross-rules are enforced in `validate`, not silently normalized.
+- Push profiles accept both `mirror` and `additive`; the mirror safety guard (empty source) lives in the push handler, not in config.
 
 ---
 
@@ -159,7 +163,7 @@ go resolver.Browse(ctx, "_presync._tcp", "local.", entries)
 
 ### Rules
 - mDNS browse has a timeout (a few seconds) — never block indefinitely waiting for a response; fall through to the stored-IP path.
-- This package is platform-dependent under the hood (relies on system mDNS support) — isolate all calls inside `internal/mdns` so a platform-specific swap doesn't ripple elsewhere. <!-- To be filled after first use: confirm Windows behavior, may need a different backend or bundled mDNS responder -->
+- This package is platform-dependent under the hood (relies on system mDNS support) — isolate all calls inside `internal/mdns` so a platform-specific swap doesn't ripple elsewhere. Pending after first use: confirm Windows behavior; may need a different backend or a bundled mDNS responder.
 
 ---
 
@@ -173,13 +177,17 @@ webView.loadUrl(pairedServerUrl)
 ```
 
 ### Common Patterns
-- Web UI calls `window.AndroidBridge.writeFile(path, base64data)`, `window.AndroidBridge.listDestination(profileName)`, etc.
-- `SafBridge` methods are annotated `@JavascriptInterface` and must be safe to call from the WebView's JS thread — heavy file I/O is dispatched to a background thread/coroutine, with the result posted back via a JS callback (`evaluateJavascript`) rather than blocking.
+- Pull contract (paths are `<profile>/<relative path>` under the picked destination tree): `buildManifest`, `hashFile`, `tempFileSize`, `writeChunk`, `finishFile`, `renameFile`, `abortFile`, `deleteFile`.
+- Push contract (paths are relative to the per-profile picked source tree): `pushBuildManifest`, `pushHashFile`, `pushReadChunk`, plus `getPushSourceDisplayPath` / `pickPushSourceFolder`.
+- `@JavascriptInterface` methods run on the WebView bridge thread; file I/O is synchronous there and the result is posted back with `evaluateJavascript`. JS calls are serialized per transfer, so ordering is preserved.
+- Callback shape is always `{success: bool, data: string}`; JSON payloads are encoded into `data` (manifests, hashes, chunk bytes).
 
 ### Rules
-- `MANAGE_EXTERNAL_STORAGE` is never requested — only `ACTION_OPEN_DOCUMENT_TREE` per destination folder, once.
+- `MANAGE_EXTERNAL_STORAGE` is never requested — only `ACTION_OPEN_DOCUMENT_TREE` per folder, once.
 - Folder URI permissions must be persisted (`takePersistableUriPermission`) so they survive app restarts — re-prompting the user on every launch is a bug.
 - All file writes through the bridge follow the same temp-file-then-rename discipline as the PC client, implemented via SAF's `DocumentFile` API.
+- SAF append is done with `ContentResolver.openOutputStream(uri, "wa")`; the temp file is created once with `DocumentFile.createFile` and must keep the requested display name. `renameFile` deletes an existing destination document before `DocumentFile.renameTo`.
+- Every bridge path is validated segment-by-segment (no absolute paths, no `.`/`..`, no backslashes) and resolved inside the picked tree, even though the page is origin-gated.
 
 ---
 

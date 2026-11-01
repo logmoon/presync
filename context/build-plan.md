@@ -168,6 +168,25 @@ Make the mode field in config actually change delete behavior.
 
 **Exit criteria:** deleting a file from an `additive` profile's source and syncing leaves it present on the recipient; doing the same on a `mirror` profile removes it from the recipient.
 
+**Status:** DONE
+
+### 11A Push profiles (client → server)
+One-way upload direction, so a phone can send files it owns to the PC.
+
+**UI:**
+- Android profile card: per-profile source folder picker + "Send to PC"
+- PC Profiles screen: receive folder, direction badge, no sync button
+
+**Logic:**
+- `direction = "push"` profile with a server-side `destination`
+- `POST /push` computes the delta from the client manifest; uploads append to `.presync-tmp` with server-owned offsets
+- SHA-256 verified before atomic rename; mirror deletions persisted in the session and applied only on `/push/complete`
+- Empty source manifest refused for mirror when the destination has files
+
+**Exit criteria:** a phone uploads only changed files, resume works after a dropped connection, additive never deletes, and mirror deletes only after a successful complete.
+
+**Status:** DONE
+
 ### 12 Auto-sync on same network
 Background sync without manual triggering.
 

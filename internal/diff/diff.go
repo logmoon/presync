@@ -82,6 +82,9 @@ func BuildManifest(root string) (Manifest, error) {
 		if err != nil {
 			return fmt.Errorf("computing relative path for %s: %w", path, err)
 		}
+		// Wire-format paths always use forward slashes so manifests from
+		// different operating systems (and the Android bridge) compare equal.
+		relPath = filepath.ToSlash(relPath)
 
 		files = append(files, FileEntry{
 			Path:    relPath,

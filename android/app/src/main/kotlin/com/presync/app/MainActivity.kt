@@ -213,6 +213,9 @@ class MainActivity : AppCompatActivity() {
         if (requestCode == SafBridge.PICK_DESTINATION_REQUEST) {
             val uri: Uri? = data?.data
             safBridge.handleDestinationPicked(uri)
+        } else if (requestCode == SafBridge.PICK_PUSH_SOURCE_REQUEST) {
+            val uri: Uri? = data?.data
+            safBridge.handlePushSourcePicked(uri)
         }
     }
 

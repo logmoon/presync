@@ -87,6 +87,8 @@ func handleProfilesDetail() http.HandlerFunc {
 		type profileDetail struct {
 			Name         string            `json:"name"`
 			Source       string            `json:"source"`
+			Direction    string            `json:"direction"`
+			Destination  string            `json:"destination,omitempty"`
 			Destinations map[string]string `json:"destinations"`
 			Mode         string            `json:"mode"`
 		}
@@ -96,6 +98,8 @@ func handleProfilesDetail() http.HandlerFunc {
 			profiles[i] = profileDetail{
 				Name:         p.Name,
 				Source:       p.Source,
+				Direction:    p.Direction,
+				Destination:  p.Destination,
 				Destinations: p.Destinations,
 				Mode:         p.Mode,
 			}
@@ -140,6 +144,10 @@ func handleWebSync() http.HandlerFunc {
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": fmt.Sprintf("profile %q not found", req.Profile)})
 			return
 		}
+		if profile.Direction == config.DirectionPush {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": fmt.Sprintf("profile %q is push-only", req.Profile)})
+			return
+		}
 
 		if _, err := os.Stat(profile.Source); os.IsNotExist(err) {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": fmt.Sprintf("source directory %q does not exist", profile.Source)})
@@ -171,9 +179,11 @@ func handleWebSync() http.HandlerFunc {
 					continue
 				}
 				logInfo("web sync: profile=%s dest=%s path=%s", req.Profile, destName, destPath)
-				_, err := client.SyncProfile(serverAddr, token, req.Profile, webDeviceID, destPath, false, nil)
+				res, err := client.SyncProfile(serverAddr, token, req.Profile, webDeviceID, destPath, false, nil)
 				if err != nil {
 					logError("web sync failed for profile %s dest %s: %v", req.Profile, destName, err)
+				} else if res.Errors > 0 {
+					logError("web sync finished for profile %s dest %s with %d file errors", req.Profile, destName, res.Errors)
 				}
 			}
 		}()
@@ -223,6 +233,11 @@ func handleWebSessions() http.HandlerFunc {
 			path := filepath.Join(dir, e.Name())
 			sess, err := transfer.LoadSession(path)
 			if err != nil {
+				continue
+			}
+			if sess.Direction != config.DirectionPull {
+				// Push sessions are driven by the paired device and must not
+				// be surfaced or auto-deleted by the PC web progress poller.
 				continue
 			}
 
