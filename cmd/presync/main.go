@@ -19,6 +19,18 @@ func main() {
 		return
 	}
 
+	if len(os.Args) >= 2 && os.Args[1] == "--watch-daemon" {
+		address := ""
+		if len(os.Args) >= 3 {
+			address = os.Args[2]
+		}
+		if err := client.RunWatcher(address); err != nil {
+			fmt.Fprintf(os.Stderr, "watcher error: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	if len(os.Args) < 2 {
 		printUsage()
 		os.Exit(1)
@@ -44,6 +56,8 @@ func main() {
 		err = runSync()
 	case "connect":
 		err = runConnect()
+	case "watch":
+		err = runWatch()
 	case "forget":
 		address := ""
 		if len(os.Args) >= 3 {
@@ -87,6 +101,11 @@ Client commands:
   connect [url]         Pair with a server (url with ?token=) or sync (no args).
                         An address without a token reconnects to that stored
                         server. --fresh forces a clean session.
+    --watch            Start the auto-sync watcher after a successful connect
+  watch [address]       Start the background auto-sync watcher
+    --status           Show whether the watcher is running
+    --stop             Stop the watcher
+    --once             Run a single auto-sync check in the foreground
   forget [address]      Forget a paired server (first one if no address given)
 
 Other:
@@ -253,7 +272,7 @@ func contains(ss []string, s string) bool {
 }
 
 func runConnect() error {
-	fresh, pairingURL, destDir := parseConnectFlags()
+	fresh, pairingURL, destDir, watch := parseConnectFlags()
 
 	progress := func(path string, done bool, err error) {
 		if done {
@@ -263,10 +282,56 @@ func runConnect() error {
 		}
 	}
 
-	return client.Connect(pairingURL, destDir, fresh, progress)
+	address, err := client.Connect(pairingURL, destDir, fresh, progress)
+	if err != nil {
+		return err
+	}
+
+	if watch {
+		if err := client.StartWatcher(address); err != nil {
+			return fmt.Errorf("starting auto-sync watcher: %w", err)
+		}
+		return nil
+	}
+
+	fmt.Println("Run 'presync watch' to sync automatically when this server is reachable.")
+	return nil
 }
 
-func parseConnectFlags() (fresh bool, pairingURL, destDir string) {
+func runWatch() error {
+	address, stop, status, once := parseWatchFlags()
+
+	switch {
+	case stop:
+		return client.StopWatcher()
+	case status:
+		return client.WatcherStatus()
+	case once:
+		return client.RunWatcherOnce(address)
+	default:
+		return client.StartWatcher(address)
+	}
+}
+
+func parseWatchFlags() (address string, stop, status, once bool) {
+	for _, arg := range os.Args[2:] {
+		switch arg {
+		case "--stop":
+			stop = true
+		case "--status":
+			status = true
+		case "--once":
+			once = true
+		default:
+			if len(arg) > 0 && arg[0] != '-' {
+				address = arg
+			}
+		}
+	}
+	return address, stop, status, once
+}
+
+func parseConnectFlags() (fresh bool, pairingURL, destDir string, watch bool) {
 	args := os.Args[2:]
 	skipNext := false
 	for i, arg := range args {
@@ -276,6 +341,8 @@ func parseConnectFlags() (fresh bool, pairingURL, destDir string) {
 		}
 		if arg == "--fresh" {
 			fresh = true
+		} else if arg == "--watch" {
+			watch = true
 		} else if arg == "--dest" {
 			if i+1 < len(args) {
 				destDir = args[i+1]
@@ -287,5 +354,5 @@ func parseConnectFlags() (fresh bool, pairingURL, destDir string) {
 			pairingURL = arg
 		}
 	}
-	return fresh, pairingURL, destDir
+	return fresh, pairingURL, destDir, watch
 }

@@ -30,14 +30,21 @@ type profilesResponse struct {
 	Profiles []string `json:"profiles"`
 }
 
-func Connect(pairingURL, destOverride string, fresh bool, progress func(path string, done bool, err error)) error {
+// Connect pairs with a server or reconnects to a stored one, then syncs. It
+// returns the address of the server it used so callers can start the watcher.
+func Connect(pairingURL, destOverride string, fresh bool, progress func(path string, done bool, err error)) (string, error) {
 	if pairingURL != "" {
 		// With a token it is a pairing URL; without one it selects a stored
 		// server to reconnect to.
-		if _, _, err := parsePairingURL(pairingURL); err == nil {
-			return doPairing(pairingURL, destOverride, fresh, progress)
+		if addr, _, err := parsePairingURL(pairingURL); err == nil {
+			_, err := doPairing(pairingURL, destOverride, fresh, progress)
+			return addr, err
 		}
-		return reconnectAndSync(fresh, progress, normalizeAddr(pairingURL))
+		addr := normalizeAddr(pairingURL)
+		if _, err := reconnectAndSync(fresh, progress, addr); err != nil {
+			return "", err
+		}
+		return addr, nil
 	}
 	return reconnectAndSync(fresh, progress, "")
 }
@@ -87,10 +94,10 @@ func ForgetServer(address string) error {
 	return nil
 }
 
-func doPairing(pairingURL, destOverride string, fresh bool, progress func(path string, done bool, err error)) error {
+func doPairing(pairingURL, destOverride string, fresh bool, progress func(path string, done bool, err error)) (string, error) {
 	serverAddr, sessionToken, err := parsePairingURL(pairingURL)
 	if err != nil {
-		return fmt.Errorf("parsing pairing URL: %w", err)
+		return "", fmt.Errorf("parsing pairing URL: %w", err)
 	}
 
 	fmt.Printf("Connecting to %s...\n", serverAddr)
@@ -102,7 +109,7 @@ func doPairing(pairingURL, destOverride string, fresh bool, progress func(path s
 
 	pin, err := pairAccept(serverAddr, sessionToken, deviceName)
 	if err != nil {
-		return fmt.Errorf("pairing accept: %w", err)
+		return "", fmt.Errorf("pairing accept: %w", err)
 	}
 
 	fmt.Printf("PIN: %s\n", pin)
@@ -111,7 +118,7 @@ func doPairing(pairingURL, destOverride string, fresh bool, progress func(path s
 
 	deviceID, longLivedToken, destinations, err := pollPairConfirmed(serverAddr, sessionToken, 60*time.Second)
 	if err != nil {
-		return fmt.Errorf("pairing confirm: %w", err)
+		return "", fmt.Errorf("pairing confirm: %w", err)
 	}
 
 	fmt.Println("Paired successfully!")
@@ -119,12 +126,12 @@ func doPairing(pairingURL, destOverride string, fresh bool, progress func(path s
 	if len(destinations) == 0 {
 		profiles, err := fetchProfiles(serverAddr, longLivedToken)
 		if err != nil {
-			return fmt.Errorf("fetching profiles: %w", err)
+			return "", fmt.Errorf("fetching profiles: %w", err)
 		}
 
 		if len(profiles) == 0 {
 			fmt.Println("No profiles configured on server.")
-			return nil
+			return serverAddr, nil
 		}
 
 		if destOverride != "" {
@@ -140,7 +147,7 @@ func doPairing(pairingURL, destOverride string, fresh bool, progress func(path s
 			baseDir := strings.TrimSpace(input)
 
 			if baseDir == "" {
-				return fmt.Errorf("no destination specified")
+				return "", fmt.Errorf("no destination specified")
 			}
 
 			destinations = make(map[string]string)
@@ -164,11 +171,11 @@ func doPairing(pairingURL, destOverride string, fresh bool, progress func(path s
 	}
 
 	if err := config.EnsureDirs(); err != nil {
-		return fmt.Errorf("preparing client config directory: %w", err)
+		return "", fmt.Errorf("preparing client config directory: %w", err)
 	}
 
 	if err := config.SaveServer(entry); err != nil {
-		return fmt.Errorf("saving server: %w", err)
+		return "", fmt.Errorf("saving server: %w", err)
 	}
 
 	fmt.Printf("Server saved. Syncing %d profile(s)...\n\n", len(destinations))
@@ -199,17 +206,17 @@ func doPairing(pairingURL, destOverride string, fresh bool, progress func(path s
 	}
 	fmt.Println()
 
-	return nil
+	return serverAddr, nil
 }
 
-func reconnectAndSync(fresh bool, progress func(path string, done bool, err error), address string) error {
+func reconnectAndSync(fresh bool, progress func(path string, done bool, err error), address string) (string, error) {
 	sf, err := config.LoadServers()
 	if err != nil {
-		return fmt.Errorf("loading servers: %w", err)
+		return "", fmt.Errorf("loading servers: %w", err)
 	}
 
 	if len(sf.Servers) == 0 {
-		return fmt.Errorf("no paired server — run 'presync connect <pairing-url>' first")
+		return "", fmt.Errorf("no paired server — run 'presync connect <pairing-url>' first")
 	}
 
 	var entry *config.ServerEntry
@@ -221,7 +228,7 @@ func reconnectAndSync(fresh bool, progress func(path string, done bool, err erro
 			}
 		}
 		if entry == nil {
-			return fmt.Errorf("no stored pairing for server %q — run 'presync connect <pairing-url>' first", address)
+			return "", fmt.Errorf("no stored pairing for server %q — run 'presync connect <pairing-url>' first", address)
 		}
 	} else {
 		entry = &sf.Servers[0]
@@ -234,24 +241,24 @@ func reconnectAndSync(fresh bool, progress func(path string, done bool, err erro
 	c := &http.Client{Timeout: 5 * time.Second}
 	resp, err := c.Get(fmt.Sprintf("http://%s/health", serverAddr))
 	if err != nil {
-		return fmt.Errorf("server not reachable at %s: %w", serverAddr, err)
+		return "", fmt.Errorf("server not reachable at %s: %w", serverAddr, err)
 	}
 	resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("server returned status %d", resp.StatusCode)
+		return "", fmt.Errorf("server returned status %d", resp.StatusCode)
 	}
 
 	fmt.Printf("Connected to %s\n", serverAddr)
 
 	profiles, err := fetchProfiles(serverAddr, token)
 	if err != nil {
-		return fmt.Errorf("fetching profiles: %w", err)
+		return "", fmt.Errorf("fetching profiles: %w", err)
 	}
 
 	if len(profiles) == 0 {
 		fmt.Println("No profiles configured on server.")
-		return nil
+		return serverAddr, nil
 	}
 
 	fmt.Printf("Syncing %d profile(s)...\n\n", len(profiles))
@@ -294,7 +301,7 @@ func reconnectAndSync(fresh bool, progress func(path string, done bool, err erro
 	}
 	fmt.Println()
 
-	return nil
+	return serverAddr, nil
 }
 
 func parsePairingURL(raw string) (serverAddr, sessionToken string, err error) {

@@ -114,7 +114,8 @@ type Profile struct {
 ```
 
 ### Rules
-- `AutoSync` must be a pointer (`*bool`) specifically so an unset value in a profile correctly falls back to `daemon.auto_sync` rather than defaulting to `false`.
+- `DaemonConfig` carries `AutoSync bool` (default `false`) and `AutoSyncCooldownMinutes int` (default 15, validated 1–1440).
+- `AutoSync` must be a pointer (`*bool`) specifically so an unset value in a profile correctly falls back to `daemon.auto_sync` rather than defaulting to `false`. Setting it on a push profile is a validation error — push profiles never auto-sync.
 - Config is read once at daemon start; a config change requires a restart in Phase 1 (hot-reload is not in scope).
 - `Mode` is validated against the literal set `{"mirror", "additive"}` at load time — an unrecognized value is a startup error, not a silent default.
 - `Direction` defaults to `pull` when omitted. Push profiles require `destination` and reject `destinations`; pull profiles reject `destination`. These cross-rules are enforced in `validate`, not silently normalized.
@@ -188,6 +189,40 @@ webView.loadUrl(pairedServerUrl)
 - All file writes through the bridge follow the same temp-file-then-rename discipline as the PC client, implemented via SAF's `DocumentFile` API.
 - SAF append is done with `ContentResolver.openOutputStream(uri, "wa")`; the temp file is created once with `DocumentFile.createFile` and must keep the requested display name. `renameFile` deletes an existing destination document before `DocumentFile.renameTo`.
 - Every bridge path is validated segment-by-segment (no absolute paths, no `.`/`..`, no backslashes) and resolved inside the picked tree, even though the page is origin-gated.
+
+---
+
+## Android: Foreground Service + Hidden WebView (auto-sync)
+
+### Setup / Initialisation
+```kotlin
+class AutoSyncService : Service() {
+    override fun onCreate() {
+        super.onCreate()
+        startForeground(NOTIFICATION_ID, notification(), ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
+        connectivity().registerDefaultNetworkCallback(callback)
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        maybeStartSync()
+        return START_STICKY
+    }
+}
+```
+
+### Common Patterns
+- Trigger decision is native (fetch `/auto-sync` with the stored token, compare the server cooldown against the persisted last-run timestamp), then the actual sync runs in a hidden WebView loading `"$serverUrl/?autosync=1"`.
+- `web/app.js` sees the query flag in `init()`, runs the normal pull path with UI/popups suppressed, and reports completion through `AndroidBridge.autoSyncFinished(ok, message)`.
+- The notification is ongoing, low importance, opens `MainActivity` on tap, and carries a "Turn off auto-sync" action (`PendingIntent.getService` with a disable action).
+- A process-wide `syncing` flag in the service and a `manualSyncActive` flag set from the visible WebView prevent overlapping syncs. The visible UI checks `AndroidBridge.isAutoSyncRunning()` before starting a manual sync.
+- Acquire a `PARTIAL_WAKE_LOCK` for the hidden sync; the service has no Activity, so `SafBridge.setSyncActive` is a no-op there.
+
+### Rules
+- Declare `FOREGROUND_SERVICE`, `FOREGROUND_SERVICE_DATA_SYNC`, `POST_NOTIFICATIONS`, and `WAKE_LOCK`; the service needs `android:foregroundServiceType="dataSync"`.
+- Start the service from a foreground context (app launch, toggle tap, `onResume`), not from `BOOT_COMPLETED` in this phase.
+- No native sync implementation — the hidden WebView is the only sync engine, so resume, hashing, SAF writes, and mirror deletes stay identical to a manual sync.
+- The hidden WebView is created with the application context on the main thread, is never attached to a window, and must be destroyed after the result callback.
+- Notification permission (Android 13+) is requested when enabling; denial hides the notification but does not block the foreground service.
 
 ---
 

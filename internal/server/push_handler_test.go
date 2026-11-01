@@ -37,7 +37,7 @@ func setupPushHandlerTest(t *testing.T, mode string, destFiles, srcFiles map[str
 	}
 
 	cfg := config.Config{
-		Daemon: config.DaemonConfig{Port: 7700, LogLevel: "info"},
+		Daemon: config.DaemonConfig{Port: 7700, LogLevel: "info", AutoSyncCooldownMinutes: 15},
 		Profiles: []config.Profile{
 			{
 				Name:        "PhoneMusic",

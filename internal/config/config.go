@@ -10,14 +10,18 @@ import (
 )
 
 const (
-	defaultPort     = 7700
-	defaultLogLevel = "info"
-	configDirName   = "presync"
-	configFileName  = "config.toml"
-	pidFileName     = "presync.pid"
-	logDirName      = "logs"
-	logFileName     = "presync.log"
-	stateDirName    = "state"
+	defaultPort                    = 7700
+	defaultLogLevel                = "info"
+	defaultAutoSyncCooldownMinutes = 15
+	maxAutoSyncCooldownMinutes     = 1440
+	configDirName                  = "presync"
+	configFileName                 = "config.toml"
+	pidFileName                    = "presync.pid"
+	watchPIDFileName               = "watch.pid"
+	logDirName                     = "logs"
+	logFileName                    = "presync.log"
+	watchLogFileName               = "watch.log"
+	stateDirName                   = "state"
 
 	DirectionPull = "pull"
 	DirectionPush = "push"
@@ -29,8 +33,10 @@ type Config struct {
 }
 
 type DaemonConfig struct {
-	Port     int    `toml:"port"`
-	LogLevel string `toml:"log_level"`
+	Port                    int    `toml:"port"`
+	LogLevel                string `toml:"log_level"`
+	AutoSync                bool   `toml:"auto_sync"`
+	AutoSyncCooldownMinutes int    `toml:"auto_sync_cooldown_minutes"`
 }
 
 type Profile struct {
@@ -47,8 +53,9 @@ type Profile struct {
 func defaults() Config {
 	return Config{
 		Daemon: DaemonConfig{
-			Port:     defaultPort,
-			LogLevel: defaultLogLevel,
+			Port:                    defaultPort,
+			LogLevel:                defaultLogLevel,
+			AutoSyncCooldownMinutes: defaultAutoSyncCooldownMinutes,
 		},
 	}
 }
@@ -72,6 +79,11 @@ func PIDPath() string {
 	return filepath.Join(ConfigDir(), pidFileName)
 }
 
+// WatchPIDPath is the PID file for the detached client auto-sync watcher.
+func WatchPIDPath() string {
+	return filepath.Join(ConfigDir(), watchPIDFileName)
+}
+
 func LogDir() string {
 	return filepath.Join(ConfigDir(), logDirName)
 }
@@ -85,6 +97,11 @@ func StateDir() string {
 
 func LogPath() string {
 	return filepath.Join(LogDir(), logFileName)
+}
+
+// WatchLogPath is the log file for the detached client auto-sync watcher.
+func WatchLogPath() string {
+	return filepath.Join(LogDir(), watchLogFileName)
 }
 
 func EnsureDirs() error {
@@ -124,6 +141,19 @@ func normalize(cfg *Config) {
 			cfg.Profiles[i].Direction = DirectionPull
 		}
 	}
+}
+
+// AutoSyncEligible reports whether a profile participates in automatic
+// syncing. Push profiles never auto-sync, and a profile-level auto_sync
+// overrides the daemon-level default.
+func (c Config) AutoSyncEligible(p Profile) bool {
+	if p.Direction == DirectionPush {
+		return false
+	}
+	if p.AutoSync != nil {
+		return *p.AutoSync
+	}
+	return c.Daemon.AutoSync
 }
 
 func SaveConfig(cfg Config) error {
@@ -170,6 +200,10 @@ func validate(cfg Config) error {
 		return fmt.Errorf("invalid log level %q: must be debug, info, or error", cfg.Daemon.LogLevel)
 	}
 
+	if cfg.Daemon.AutoSyncCooldownMinutes < 1 || cfg.Daemon.AutoSyncCooldownMinutes > maxAutoSyncCooldownMinutes {
+		return fmt.Errorf("invalid auto_sync_cooldown_minutes %d: must be 1-%d", cfg.Daemon.AutoSyncCooldownMinutes, maxAutoSyncCooldownMinutes)
+	}
+
 	seen := make(map[string]bool, len(cfg.Profiles))
 	for _, p := range cfg.Profiles {
 		if p.Mode != "mirror" && p.Mode != "additive" {
@@ -187,6 +221,9 @@ func validate(cfg Config) error {
 			}
 			if len(p.Destinations) > 0 {
 				return fmt.Errorf("profile %q: push profiles use destination, not destinations", p.Name)
+			}
+			if p.AutoSync != nil {
+				return fmt.Errorf("profile %q: auto_sync is only valid for pull profiles", p.Name)
 			}
 		default:
 			return fmt.Errorf("profile %q has invalid direction %q: must be pull or push", p.Name, p.Direction)

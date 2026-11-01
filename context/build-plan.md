@@ -200,6 +200,8 @@ Background sync without manual triggering.
 
 **Exit criteria:** with auto-sync enabled and the client device joining the same WiFi network as a paired server, a sync starts without any user action, and a second join within the cooldown window does not trigger another sync.
 
+**Status:** CODE COMPLETE — PC watcher E2E verified; Android on-device check pending.
+
 ### 13 mDNS discovery
 Survive server IP changes.
 

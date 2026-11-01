@@ -1,12 +1,17 @@
 package com.presync.app
 
+import android.Manifest
 import android.app.Activity
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
+import android.os.Build
 import android.view.WindowManager
 import android.webkit.JavascriptInterface
 import android.webkit.WebView
+import androidx.core.app.ActivityCompat
+import androidx.core.content.ContextCompat
 import androidx.documentfile.provider.DocumentFile
 import org.json.JSONArray
 import org.json.JSONObject
@@ -14,13 +19,15 @@ import java.security.MessageDigest
 import java.util.Base64
 
 class SafBridge(
-    private val activity: Activity,
+    private val context: Context,
     private val webView: WebView,
-    private val trustedOrigin: String?
+    private val trustedOrigin: String?,
+    private val activity: Activity? = null,
+    private val onAutoSyncFinished: ((Boolean, String) -> Unit)? = null
 ) {
 
     private val prefs by lazy {
-        activity.getSharedPreferences("presync_auth", Context.MODE_PRIVATE)
+        context.getSharedPreferences("presync_auth", Context.MODE_PRIVATE)
     }
 
     @Volatile
@@ -79,11 +86,15 @@ class SafBridge(
     @JavascriptInterface
     fun setSyncActive(active: Boolean) {
         if (!isTrustedPage()) return
-        activity.runOnUiThread {
+        // A headless auto-sync has no Activity; the service holds a wake lock
+        // for the duration instead.
+        val act = activity ?: return
+        AutoSyncService.setManualSyncActive(act, active)
+        act.runOnUiThread {
             if (active) {
-                activity.window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                act.window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
             } else {
-                activity.window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                act.window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
             }
         }
     }
@@ -191,7 +202,7 @@ class SafBridge(
             }
 
             val bytes = Base64.getDecoder().decode(base64Data)
-            activity.contentResolver.openOutputStream(temp.uri, "wa")?.use { out ->
+            context.contentResolver.openOutputStream(temp.uri, "wa")?.use { out ->
                 out.write(bytes)
             } ?: run {
                 invokeCallback(callback, false, "Failed to open temp file for append")
@@ -341,7 +352,7 @@ class SafBridge(
 
     private fun hashDocument(document: DocumentFile): String {
         val digest = MessageDigest.getInstance("SHA-256")
-        activity.contentResolver.openInputStream(document.uri)?.use { input ->
+        context.contentResolver.openInputStream(document.uri)?.use { input ->
             val buffer = ByteArray(64 * 1024)
             while (true) {
                 val read = input.read(buffer)
@@ -355,7 +366,7 @@ class SafBridge(
 
     private fun getDestinationRoot(): DocumentFile? {
         val uri = getDestinationUri() ?: return null
-        return DocumentFile.fromTreeUri(activity, uri)
+        return DocumentFile.fromTreeUri(context, uri)
     }
 
     private fun resolvePath(relativePath: String): DocumentFile? {
@@ -423,13 +434,14 @@ class SafBridge(
         if (!isTrustedPage()) return
         if (!isSafeSegment(profileName)) return
         pendingPushProfile = profileName
-        activity.runOnUiThread {
+        val act = activity ?: return
+        act.runOnUiThread {
             val intent = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).apply {
                 flags = Intent.FLAG_GRANT_READ_URI_PERMISSION or
                         Intent.FLAG_GRANT_WRITE_URI_PERMISSION or
                         Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION
             }
-            activity.startActivityForResult(intent, PICK_PUSH_SOURCE_REQUEST)
+            act.startActivityForResult(intent, PICK_PUSH_SOURCE_REQUEST)
         }
     }
 
@@ -447,7 +459,7 @@ class SafBridge(
         }
 
         try {
-            activity.contentResolver.takePersistableUriPermission(
+            context.contentResolver.takePersistableUriPermission(
                 uri,
                 Intent.FLAG_GRANT_READ_URI_PERMISSION
             )
@@ -529,7 +541,7 @@ class SafBridge(
                 invokeCallback(callback, false, "File not found: $relativePath")
                 return
             }
-            val input = activity.contentResolver.openInputStream(document.uri) ?: run {
+            val input = context.contentResolver.openInputStream(document.uri) ?: run {
                 invokeCallback(callback, false, "Cannot read file: $relativePath")
                 return
             }
@@ -582,7 +594,7 @@ class SafBridge(
         if (!isSafeSegment(profileName)) return null
         val uriString = prefs.getString(pushSourceKey(profileName), null) ?: return null
         return try {
-            DocumentFile.fromTreeUri(activity, Uri.parse(uriString))
+            DocumentFile.fromTreeUri(context, Uri.parse(uriString))
         } catch (e: Exception) {
             null
         }
@@ -592,7 +604,7 @@ class SafBridge(
         for ((key, value) in prefs.all) {
             if (!key.startsWith("push_source_uri_") || value !is String) continue
             try {
-                activity.contentResolver.releasePersistableUriPermission(
+                context.contentResolver.releasePersistableUriPermission(
                     Uri.parse(value),
                     Intent.FLAG_GRANT_READ_URI_PERMISSION
                 )
@@ -608,7 +620,7 @@ class SafBridge(
         val uriString = prefs.getString("destination_uri", null) ?: return ""
         return try {
             val uri = Uri.parse(uriString)
-            val docFile = DocumentFile.fromTreeUri(activity, uri)
+            val docFile = DocumentFile.fromTreeUri(context, uri)
             docFile?.name ?: uri.lastPathSegment ?: ""
         } catch (e: Exception) {
             ""
@@ -618,35 +630,38 @@ class SafBridge(
     @JavascriptInterface
     fun clearServerData() {
         if (!isTrustedPage()) return
+        AutoSyncService.setEnabled(context, false)
         releaseDestinationGrant()
         releasePushGrants()
         prefs.edit().clear().apply()
-        activity.runOnUiThread {
-            val intent = Intent(activity, PairingActivity::class.java).apply {
+        val act = activity ?: return
+        act.runOnUiThread {
+            val intent = Intent(act, PairingActivity::class.java).apply {
                 flags = Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_NEW_TASK
             }
-            activity.startActivity(intent)
-            activity.finish()
+            act.startActivity(intent)
+            act.finish()
         }
     }
 
     @JavascriptInterface
     fun pickDestinationFolder() {
         if (!isTrustedPage()) return
-        activity.runOnUiThread {
+        val act = activity ?: return
+        act.runOnUiThread {
             val intent = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).apply {
                 flags = Intent.FLAG_GRANT_READ_URI_PERMISSION or
                         Intent.FLAG_GRANT_WRITE_URI_PERMISSION or
                         Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION
             }
-            activity.startActivityForResult(intent, PICK_DESTINATION_REQUEST)
+            act.startActivityForResult(intent, PICK_DESTINATION_REQUEST)
         }
     }
 
     fun handleDestinationPicked(uri: Uri?) {
         if (uri != null) {
             try {
-                activity.contentResolver.takePersistableUriPermission(
+                context.contentResolver.takePersistableUriPermission(
                     uri,
                     Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
                 )
@@ -664,7 +679,7 @@ class SafBridge(
     private fun releaseDestinationGrant() {
         val uriString = prefs.getString("destination_uri", null) ?: return
         try {
-            activity.contentResolver.releasePersistableUriPermission(
+            context.contentResolver.releasePersistableUriPermission(
                 Uri.parse(uriString),
                 Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
             )
@@ -684,7 +699,7 @@ class SafBridge(
             put("data", data)
         }
         val script = "javascript:$callback($json)"
-        activity.runOnUiThread {
+        webView.post {
             webView.evaluateJavascript(script, null)
         }
     }
@@ -695,13 +710,57 @@ class SafBridge(
             put("data", data)
         }
         val script = "javascript:$functionName($json)"
-        activity.runOnUiThread {
+        webView.post {
             webView.evaluateJavascript(script, null)
         }
+    }
+
+    // --- Auto-sync ---
+
+    @JavascriptInterface
+    fun getAutoSyncEnabled(): Boolean {
+        if (!isTrustedPage()) return false
+        return AutoSyncService.isEnabled(context)
+    }
+
+    @JavascriptInterface
+    fun setAutoSyncEnabled(enabled: Boolean) {
+        if (!isTrustedPage()) return
+        AutoSyncService.setEnabled(context, enabled)
+        if (enabled) {
+            activity?.let { requestNotificationPermission(it) }
+        }
+    }
+
+    @JavascriptInterface
+    fun isAutoSyncRunning(): Boolean {
+        if (!isTrustedPage()) return false
+        return AutoSyncService.isSyncing()
+    }
+
+    @JavascriptInterface
+    fun autoSyncFinished(ok: Boolean, message: String) {
+        if (!isTrustedPage()) return
+        onAutoSyncFinished?.invoke(ok, message)
+    }
+
+    private fun requestNotificationPermission(act: Activity) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return
+        if (ContextCompat.checkSelfPermission(act, Manifest.permission.POST_NOTIFICATIONS) ==
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            return
+        }
+        ActivityCompat.requestPermissions(
+            act,
+            arrayOf(Manifest.permission.POST_NOTIFICATIONS),
+            REQUEST_NOTIFICATIONS
+        )
     }
 
     companion object {
         const val PICK_DESTINATION_REQUEST = 1001
         const val PICK_PUSH_SOURCE_REQUEST = 1002
+        const val REQUEST_NOTIFICATIONS = 1003
     }
 }

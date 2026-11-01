@@ -3,18 +3,17 @@
 ## Current Status
 
 **Phase:** Phase 2 — Polish
-**Last completed:** Manual E2E device test (push + small pull + music pull) — accepted; Progress multi-session list UI + review fix
-**Next:** 12 Auto-sync on same network
+**Last completed:** 12 Auto-sync on same network — reviewed and closed (Android on-device verification deferred)
+**Next:** 13 mDNS discovery
 
 ---
 
 ## In Progress
 
-None. The music pull is still finishing on the phone in the background; its additive check and final zero-delta sync are follow-ups after Task 12 if not done beforehand.
+None. Android auto-sync still needs a real-device check (network join, notification action, cooldown across process restart); the code, Go tests, PC E2E, and APK build are complete.
 
 ## Up Next
 
-- 12 Auto-sync on same network
 - 13 mDNS discovery
 - 14 Sync history / logs in UI
 - 15 Cross-compile client binaries
@@ -45,7 +44,7 @@ None.
 - [x] 11 Per-profile sync modes (mirror / additive)
 - [x] 11A Push profiles (client → server)
 - [x] Manual end-to-end device test (pull + push)
-- [ ] 12 Auto-sync on same network
+- [x] 12 Auto-sync on same network (PC E2E verified; Android on-device check deferred)
 - [ ] 13 mDNS discovery
 - [ ] 14 Sync history / logs in UI
 - [ ] 15 Cross-compile client binaries
@@ -120,6 +119,7 @@ _Add decisions here as they are made during implementation._
 - **Last-synced baseline** (Phase 5 fix): recipient mtimes are never preserved (Android SAF writes a new one), so the old delta classified every synced file as changed and resume/repeat syncs re-transferred everything. The server now keeps `state/<device-id>-<profile>.json` with the source metadata of what the device actually got, computes deltas against it (`diff.ComputeDeltaWithBase`), and reconciles resume state against source metadata instead of destination mtimes. Pull and push both use it; web-initiated syncs key the baseline by a per-destination device ID.
 - **Progress state** (Phase 5 fix): one Progress card renderer drives live, paused, server-driven, and completed states; counts initialize from session states (no restart at zero), the current filename is shown, Stop leaves a paused card with Resume, and `/web/sessions` is device-filtered with push sessions included.
 - **Manual E2E results** (Phase 5): push verified end to end (5 files including a 30MB `big.bin`, changed-file-only re-upload, Stop at 75% → Resume continued at the server offset, zero-delta repeat, mirror delete applied only after complete). Small pull verified the same way (baseline, Stop at 38% → resume at offset, mirror delete, zero-delta). All four isolated E2E scripts pass (transfer 48, connect 13, push 29, pairing 19).
+- **Auto-sync split** (Task 12): the server's `config.toml` owns eligibility (`[daemon] auto_sync`, `auto_sync_cooldown_minutes`, per-profile `auto_sync` override; push never eligible); each client owns the master switch. PC uses a detached `presync watch` process (30s health poll, persisted cooldown in `servers.json`); Android uses a `dataSync` foreground service with a hidden WebView loading `?autosync=1`, reusing the normal JS pull path. The service and visible WebView share an owner-scoped manual-sync lock. Last trigger time is recorded before syncing, so failures also respect the cooldown.
 - **Progress shows every session** (Phase 5 fix): `renderProgressView` lists the live local card, the locally paused session, and every non-complete `/web/sessions` entry, deduped by profile+direction. The poll now runs during a local transfer too, per-card Stop/Resume replace the single-card ids, Resume is disabled while a sync runs, and the nav pulse clears when nothing is active. Verified headlessly with two sessions rendered newest-first.
 
 ---

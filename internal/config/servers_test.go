@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func setupServersTest(t *testing.T) {
@@ -182,5 +183,35 @@ func TestServersPath(t *testing.T) {
 	got := ServersPath()
 	if got != expected {
 		t.Errorf("expected %s, got %s", expected, got)
+	}
+}
+
+func TestTouchAutoSync(t *testing.T) {
+	setupServersTest(t)
+
+	entry := ServerEntry{
+		Address:  "192.168.1.5:7700",
+		Token:    "abc123",
+		DeviceID: "deadbeef",
+	}
+	if err := SaveServer(entry); err != nil {
+		t.Fatal(err)
+	}
+
+	at := time.Date(2026, 11, 1, 12, 0, 0, 0, time.UTC)
+	if err := TouchAutoSync(entry.Address, at); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := GetServer(entry.Address)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.LastAutoSyncAt.Equal(at) {
+		t.Errorf("last auto sync: got %v, want %v", got.LastAutoSyncAt, at)
+	}
+
+	if err := TouchAutoSync("10.0.0.99:7700", at); err == nil {
+		t.Fatal("expected error for unknown server")
 	}
 }

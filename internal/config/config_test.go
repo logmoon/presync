@@ -151,7 +151,7 @@ func TestSaveConfigRoundtrip(t *testing.T) {
 	t.Setenv("PRESYNC_CONFIG_DIR", dir)
 
 	cfg := Config{
-		Daemon: DaemonConfig{Port: 8123, LogLevel: "debug"},
+		Daemon: DaemonConfig{Port: 8123, LogLevel: "debug", AutoSyncCooldownMinutes: 15},
 		Profiles: []Profile{
 			{
 				Name: "Music",
@@ -199,7 +199,7 @@ func TestSaveConfigRejectsInvalid(t *testing.T) {
 
 	// Invalid mode must be rejected by SaveConfig, matching Load()
 	bad := Config{
-		Daemon:   DaemonConfig{Port: 7700, LogLevel: "info"},
+		Daemon:   DaemonConfig{Port: 7700, LogLevel: "info", AutoSyncCooldownMinutes: 15},
 		Profiles: []Profile{{Name: "Music", Mode: "sideways"}},
 	}
 	if err := SaveConfig(bad); err == nil {
@@ -208,7 +208,7 @@ func TestSaveConfigRejectsInvalid(t *testing.T) {
 
 	// Empty profile name rejected
 	empty := Config{
-		Daemon:   DaemonConfig{Port: 7700, LogLevel: "info"},
+		Daemon:   DaemonConfig{Port: 7700, LogLevel: "info", AutoSyncCooldownMinutes: 15},
 		Profiles: []Profile{{Name: "", Mode: "mirror"}},
 	}
 	if err := SaveConfig(empty); err == nil {
@@ -217,7 +217,7 @@ func TestSaveConfigRejectsInvalid(t *testing.T) {
 
 	// Path-unsafe profile name rejected
 	unsafe := Config{
-		Daemon:   DaemonConfig{Port: 7700, LogLevel: "info"},
+		Daemon:   DaemonConfig{Port: 7700, LogLevel: "info", AutoSyncCooldownMinutes: 15},
 		Profiles: []Profile{{Name: "a/b", Mode: "mirror"}},
 	}
 	if err := SaveConfig(unsafe); err == nil {
@@ -226,7 +226,7 @@ func TestSaveConfigRejectsInvalid(t *testing.T) {
 
 	// Duplicate profile names rejected
 	dupes := Config{
-		Daemon: DaemonConfig{Port: 7700, LogLevel: "info"},
+		Daemon: DaemonConfig{Port: 7700, LogLevel: "info", AutoSyncCooldownMinutes: 15},
 		Profiles: []Profile{
 			{Name: "Music", Mode: "mirror"},
 			{Name: "Music", Mode: "additive"},
@@ -306,7 +306,7 @@ local = "/tmp/music"
 func TestValidateDirectionRules(t *testing.T) {
 	base := func() Config {
 		return Config{
-			Daemon: DaemonConfig{Port: 7700, LogLevel: "info"},
+			Daemon: DaemonConfig{Port: 7700, LogLevel: "info", AutoSyncCooldownMinutes: 15},
 		}
 	}
 
@@ -352,6 +352,138 @@ func TestValidateDirectionRules(t *testing.T) {
 			}
 			if !tt.wantErr && err != nil {
 				t.Fatalf("unexpected error: %v", err)
+			}
+		})
+	}
+}
+
+func TestAutoSyncEligible(t *testing.T) {
+	on := true
+	off := false
+
+	tests := []struct {
+		name    string
+		daemon  bool
+		profile Profile
+		want    bool
+	}{
+		{name: "daemon off, no override", daemon: false, profile: Profile{Direction: DirectionPull}, want: false},
+		{name: "daemon on, no override", daemon: true, profile: Profile{Direction: DirectionPull}, want: true},
+		{name: "daemon on, profile off", daemon: true, profile: Profile{Direction: DirectionPull, AutoSync: &off}, want: false},
+		{name: "daemon off, profile on", daemon: false, profile: Profile{Direction: DirectionPull, AutoSync: &on}, want: true},
+		{name: "push never eligible", daemon: true, profile: Profile{Direction: DirectionPush}, want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := Config{Daemon: DaemonConfig{AutoSync: tt.daemon}}
+			if got := cfg.AutoSyncEligible(tt.profile); got != tt.want {
+				t.Fatalf("AutoSyncEligible() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestLoadAutoSyncConfig(t *testing.T) {
+	dir := t.TempDir()
+	cfgContent := `[daemon]
+port = 7700
+log_level = "info"
+auto_sync = true
+auto_sync_cooldown_minutes = 5
+
+[[profiles]]
+name = "Music"
+source = "/home/user/Music"
+mode = "mirror"
+
+[profiles.destinations]
+local = "/mnt/music"
+
+[[profiles]]
+name = "Videos"
+source = "/home/user/Videos"
+mode = "additive"
+auto_sync = false
+
+[profiles.destinations]
+local = "/mnt/videos"
+`
+	if err := os.WriteFile(filepath.Join(dir, "config.toml"), []byte(cfgContent), 0o644); err != nil {
+		t.Fatalf("writing test config: %v", err)
+	}
+	t.Setenv("PRESYNC_CONFIG_DIR", dir)
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() returned error: %v", err)
+	}
+
+	if !cfg.Daemon.AutoSync {
+		t.Error("daemon auto_sync: got false, want true")
+	}
+	if cfg.Daemon.AutoSyncCooldownMinutes != 5 {
+		t.Errorf("cooldown: got %d, want 5", cfg.Daemon.AutoSyncCooldownMinutes)
+	}
+	if !cfg.AutoSyncEligible(cfg.Profiles[0]) {
+		t.Error("Music should be eligible via daemon default")
+	}
+	if cfg.AutoSyncEligible(cfg.Profiles[1]) {
+		t.Error("Videos should not be eligible via profile override")
+	}
+}
+
+func TestLoadAutoSyncDefaults(t *testing.T) {
+	dir := t.TempDir()
+	cfgContent := `[daemon]
+port = 7700
+log_level = "info"
+`
+	if err := os.WriteFile(filepath.Join(dir, "config.toml"), []byte(cfgContent), 0o644); err != nil {
+		t.Fatalf("writing test config: %v", err)
+	}
+	t.Setenv("PRESYNC_CONFIG_DIR", dir)
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() returned error: %v", err)
+	}
+	if cfg.Daemon.AutoSync {
+		t.Error("auto_sync should default to false")
+	}
+	if cfg.Daemon.AutoSyncCooldownMinutes != defaultAutoSyncCooldownMinutes {
+		t.Errorf("cooldown default: got %d, want %d", cfg.Daemon.AutoSyncCooldownMinutes, defaultAutoSyncCooldownMinutes)
+	}
+}
+
+func TestLoadAutoSyncInvalid(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+	}{
+		{
+			name: "cooldown zero",
+			body: "[daemon]\nport = 7700\nlog_level = \"info\"\nauto_sync_cooldown_minutes = 0\n",
+		},
+		{
+			name: "cooldown too large",
+			body: "[daemon]\nport = 7700\nlog_level = \"info\"\nauto_sync_cooldown_minutes = 1441\n",
+		},
+		{
+			name: "push profile with auto_sync",
+			body: "[daemon]\nport = 7700\nlog_level = \"info\"\n\n[[profiles]]\nname = \"p\"\ndirection = \"push\"\ndestination = \"/tmp/p\"\nmode = \"additive\"\nauto_sync = true\n",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			if err := os.WriteFile(filepath.Join(dir, "config.toml"), []byte(tt.body), 0o644); err != nil {
+				t.Fatalf("writing test config: %v", err)
+			}
+			t.Setenv("PRESYNC_CONFIG_DIR", dir)
+			if _, err := Load(); err == nil {
+				t.Fatal("expected error, got nil")
 			}
 		})
 	}

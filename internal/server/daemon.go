@@ -304,6 +304,7 @@ func newServer(cfg *config.Config) *http.Server {
 	mux.HandleFunc("/web/sessions", withWebAuth(handleWebSessions()))
 	mux.HandleFunc("/profiles", withWebAuth(handleProfiles()))
 	mux.HandleFunc("/profiles/detail", withWebAuth(handleProfilesDetail()))
+	mux.HandleFunc("/auto-sync", withWebAuth(handleAutoSync()))
 	mux.HandleFunc("/status", withWebAuth(handleStatus()))
 
 	// Device-token-only routes: raw file transfer and sync state mutation

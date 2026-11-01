@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 )
 
 const serversFileName = "servers.json"
@@ -16,11 +17,12 @@ type ServerProfile struct {
 }
 
 type ServerEntry struct {
-	Address  string          `json:"address"`
-	Token    string          `json:"token"`
-	DeviceID string          `json:"device_id"`
-	Name     string          `json:"name"`
-	Profiles []ServerProfile `json:"profiles"`
+	Address        string          `json:"address"`
+	Token          string          `json:"token"`
+	DeviceID       string          `json:"device_id"`
+	Name           string          `json:"name"`
+	Profiles       []ServerProfile `json:"profiles"`
+	LastAutoSyncAt time.Time       `json:"last_auto_sync_at,omitempty"`
 }
 
 type ServersFile struct {
@@ -122,6 +124,27 @@ func SaveServer(entry ServerEntry) error {
 
 	sf.Servers = append(sf.Servers, entry)
 	return saveServersLocked(sf)
+}
+
+// TouchAutoSync records when the watcher last triggered an auto-sync for a
+// server. It is persisted so restarting the watcher cannot bypass the cooldown.
+func TouchAutoSync(address string, at time.Time) error {
+	serversMu.Lock()
+	defer serversMu.Unlock()
+
+	sf, err := loadServersLocked()
+	if err != nil {
+		return err
+	}
+
+	for i := range sf.Servers {
+		if sf.Servers[i].Address == address {
+			sf.Servers[i].LastAutoSyncAt = at.UTC()
+			return saveServersLocked(sf)
+		}
+	}
+
+	return fmt.Errorf("server %q not found", address)
 }
 
 func RemoveServer(address string) error {

@@ -35,7 +35,7 @@ func setupSyncHandlerTest(t *testing.T, srcFiles map[string]string) (string, str
 	}
 
 	cfg := config.Config{
-		Daemon: config.DaemonConfig{Port: 7700, LogLevel: "info"},
+		Daemon: config.DaemonConfig{Port: 7700, LogLevel: "info", AutoSyncCooldownMinutes: 15},
 		Profiles: []config.Profile{
 			{Name: "music", Source: srcDir, Mode: "mirror"},
 		},

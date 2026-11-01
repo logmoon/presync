@@ -168,6 +168,10 @@ Every section that can be empty must show one — never a blank card. Secondary 
 | Border radius    | 11px (pill shape)              |
 | Knob             | 16px circle, `var(--text-primary)`, 2px inset |
 | Knob transition  | transform 0.2s, translateX(18px) when on |
+| Disabled         | opacity: 0.4, cursor: not-allowed, `aria-disabled="true"` |
+
+**Pattern notes:**
+The Settings auto-sync toggle is disabled (with an explanatory `card-subtitle` caption below it) whenever the server has no eligible profiles, the client is not Android, the app is too old, or no sync folder is picked. Never leave a toggle clickable when the action cannot succeed.
 
 ### Loading State
 

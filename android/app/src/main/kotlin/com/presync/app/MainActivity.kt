@@ -160,7 +160,7 @@ class MainActivity : AppCompatActivity() {
         webView = WebView(this).also { setContentView(it) }
 
         trustedOrigin = originOf(url)
-        safBridge = SafBridge(this, webView, trustedOrigin)
+        safBridge = SafBridge(this, webView, trustedOrigin, this)
         safBridge.updateCurrentUrl(url)
 
         webView.settings.apply {
@@ -203,10 +203,38 @@ class MainActivity : AppCompatActivity() {
                     }
                 }
             }
+
+            override fun onRenderProcessGone(
+                view: WebView,
+                detail: android.webkit.RenderProcessGoneDetail
+            ): Boolean {
+                // A dead renderer cannot deliver its "sync finished" callback.
+                AutoSyncService.clearManualSyncOwner(this@MainActivity)
+                val serverUrl = getServerUrl()
+                if (serverUrl != null && !isFinishing) {
+                    showRetryScreen(serverUrl)
+                }
+                return true
+            }
         }
 
         webView.webChromeClient = WebChromeClient()
         webView.loadUrl(url)
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // Restart the watcher if the system stopped it while the app was away.
+        if (getServerUrl() != null) {
+            AutoSyncService.startIfEnabled(this)
+        }
+    }
+
+    override fun onDestroy() {
+        // A destroyed WebView cannot deliver its "sync finished" callback, so
+        // never leave the process-wide manual-sync flag stuck on.
+        AutoSyncService.clearManualSyncOwner(this)
+        super.onDestroy()
     }
 
     @Deprecated("Deprecated in Java")

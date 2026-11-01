@@ -35,6 +35,10 @@ presync/
 │   │   └── trust_middleware.go # token scope + loopback admin gates
 │   ├── client/                # Client-mode only: connect, pull manifest, write files
 │   │   ├── connect.go        # establishes connection, sends stored token, drives a sync
+│   │   ├── auto_sync.go      # fetches server auto-sync eligibility + cooldown
+│   │   ├── watch.go          # detached auto-sync watcher: poll, cooldown, sync
+│   │   ├── watch_unix.go     # detach/stop/liveness for Unix
+│   │   ├── watch_windows.go  # detach/stop/liveness for Windows
 │   │   └── apply.go          # writes received files to local filesystem (PC) via temp+rename
 │   ├── diff/                  # Pure computation — no I/O
 │   │   └── diff.go           # builds manifests, computes delta (add/update/delete)
@@ -55,6 +59,7 @@ presync/
 │   └── app/src/main/
 │       ├── MainActivity.kt    # WebView host, loads server's web UI by URL
 │       ├── SafBridge.kt       # JavascriptInterface: exposes file ops to the loaded web UI
+│       ├── AutoSyncService.kt # foreground watcher: hidden WebView drives the web UI sync
 │       └── res/
 ├── go.mod
 └── go.sum
@@ -121,6 +126,24 @@ Server → session.go checks for existing session file for this device + profile
 `presync sync --fresh` forces a new session regardless of existing state
 ```
 
+### Flow: Auto-sync (client-initiated, pull only)
+```
+Server config.toml → [daemon] auto_sync (default off) + auto_sync_cooldown_minutes;
+                     per-profile auto_sync overrides the daemon default
+Client           → local master switch (Android prefs / servers.json per server)
+Client           → GET /auto-sync {cooldown_minutes, profiles} with its device token
+Client           → if local switch on, cooldown elapsed, server reachable:
+                   record last trigger time, then run the normal pull flow for
+                   each eligible profile
+PC               → detached `presync watch` process (PID/log, --status/--stop)
+Android          → foreground service: network callback + 60s check; on trigger
+                   loads the server UI into a hidden WebView with ?autosync=1,
+                   which reuses web/app.js's pull path silently
+```
+The eligibility list is advisory in one direction only: clients can never
+auto-sync a profile the server did not mark eligible, and push profiles are
+never auto-synced.
+
 ### Flow: Push Execution (client → server, additive or mirror)
 ```
 Client → builds a manifest of its locally chosen source folder
@@ -144,8 +167,10 @@ Server → (mirror only) applies the persisted deletion list, then deletes the
 
 None. State is stored as flat files, owned exclusively by `internal/config`:
 
-- `config.toml` — profiles and daemon settings (see Config below)
+- `config.toml` — profiles and daemon settings, including `auto_sync` eligibility and `auto_sync_cooldown_minutes`
 - `devices.json` — paired device identities + long-lived tokens
+- `servers.json` (client) — paired server, token, per-profile destinations, and the last auto-sync trigger time used for the cooldown
+- `watch.pid` / `logs/watch.log` (client) — detached PC watcher lifecycle; paths owned by `internal/config`
 - `sessions/<device-id>-<profile>-<timestamp>.json` — per-file sync state (`pending` / `in_progress` / `done`), the profile `direction`, the source `size`/`mod_time` each entry was created from, and (mirror push only) the planned `to_delete` list
 - `state/<device-id>-<profile>.json` — last-synced baseline per device+profile: path, size, mod_time, SHA-256 of what the recipient actually received. Written on completion, used for every later delta, deleted on unpair.
 
@@ -155,7 +180,7 @@ None. State is stored as flat files, owned exclusively by `internal/config`:
 - **Pairing handshake:** QR-encoded single-use session token (60s TTL) + a 4-digit PIN both sides display and the user confirms manually. This is the only point requiring human interaction. The session token is consumed on first `/pair/accept` — a second device scanning the same QR is rejected.
 - **Steady state:** client sends its stored 256-bit long-lived token on every request; server validates against `devices.json`. No QR, no PIN, no further confirmation.
 - **Protected routes:** every endpoint except `/pair`, `/pair/accept`, `/pair/confirmed` (session-token bound), `/pair/destinations` (session-token bound), `/web/token` (scoped bootstrap), and static files requires a valid token.
-- **Token scoping:** the local token served by `/web/token` is only accepted on web-UI routes (`/web/*`, `/profiles/*`, `/status`) and — over loopback only — on `/sync*` and `/push*` (CLI/self-hosted tests). A remote caller can never use it to download or upload files. Pairing admin actions (`/pair/confirm`, `/pair/discard`, `/pair/status`, `/reload`) require the local token **and** a loopback connection.
+- **Token scoping:** the local token served by `/web/token` is only accepted on web-UI routes (`/web/*`, `/profiles/*`, `/auto-sync`, `/status`) and — over loopback only — on `/sync*` and `/push*` (CLI/self-hosted tests). A remote caller can never use it to download or upload files. Pairing admin actions (`/pair/confirm`, `/pair/discard`, `/pair/status`, `/reload`) require the local token **and** a loopback connection.
 - **Revocation:** `presync unpair` removes the device from `devices.json`; its token is rejected on the very next request — no grace period. Unpair also removes the device's destination entries from `config.toml` and deletes its session files.
 - **Transport:** plain HTTP on the LAN for Phase 1 (documented, accepted risk for a personal local tool). HTTPS with a self-signed cert is a Phase 3 addition — no Phase 1/2 code should assume or hardcode `https://`.
 
@@ -175,3 +200,5 @@ None. State is stored as flat files, owned exclusively by `internal/config`:
 12. Stale session files older than 7 days are pruned on server start, and `presync sync --fresh` must always be honored as "ignore any existing session, start clean" regardless of session age. The `fresh` flag is also honored server-side for remote clients. Incomplete sessions are considered stale (and resumable state discarded) after 30 minutes of inactivity.
 13. A mirror push never deletes anything when the client reports an empty source manifest while the destination contains files, and never before every upload in that session has been hash-verified and the session completed.
 14. Deltas for a device+profile are computed against that device's last-synced baseline, never against recipient mtimes — Android SAF cannot preserve them, so mtime comparison would re-transfer the whole library on every run. The recipient manifest is used only for presence/size checks and mirror deletions. `presync sync --fresh` discards the session but keeps the baseline; unpair deletes it.
+15. Auto-sync never bypasses the normal sync path: it triggers the same `/sync` session, hash verification, mirror-deletion ordering, and baseline update as a manual sync. The server's `config.toml` decides which pull profiles are eligible; each client owns its local master switch; the last trigger time is persisted so restarting the watcher cannot bypass the cooldown. Push profiles are never auto-synced.
+16. At most one sync runs per client process at a time. On Android the foreground service and the visible WebView share a process-wide lock, so a background auto-sync cannot overlap a manual pull or push.

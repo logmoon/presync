@@ -221,7 +221,7 @@ func TestReconnectAndSync_NoServers(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("PRESYNC_CONFIG_DIR", dir)
 
-	err := reconnectAndSync(false, nil, "")
+	_, err := reconnectAndSync(false, nil, "")
 	if err == nil {
 		t.Fatal("expected error for no servers")
 	}
@@ -238,7 +238,7 @@ func TestReconnectAndSync_ServerDown(t *testing.T) {
 		Profiles: []config.ServerProfile{{Name: "Music", Destination: "/tmp/music"}},
 	})
 
-	err := reconnectAndSync(false, nil, "")
+	_, err := reconnectAndSync(false, nil, "")
 	if err == nil {
 		t.Fatal("expected error for unreachable server")
 	}
@@ -273,7 +273,7 @@ func TestReconnectAndSync_Success(t *testing.T) {
 		Profiles: []config.ServerProfile{{Name: "Music", Destination: t.TempDir()}},
 	})
 
-	err := reconnectAndSync(false, nil, "")
+	_, err := reconnectAndSync(false, nil, "")
 	if err != nil {
 		t.Fatal(err)
 	}

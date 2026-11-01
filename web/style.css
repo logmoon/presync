@@ -380,6 +380,11 @@ h2 {
     transform: translateX(18px);
 }
 
+.toggle.disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+}
+
 /* Error text */
 
 .error-text {

@@ -19,6 +19,11 @@
     var progressSessions = [];
     var progressCompleted = null;
     var bridgeCallbackSeq = 0;
+    var androidAutoSyncMode = false;
+    var androidAutoSyncQueue = [];
+    var androidAutoSyncIndex = 0;
+    var androidAutoSyncFiles = 0;
+    var androidAutoSyncErrors = 0;
 
     // Android's JavascriptInterface can only receive strings, not functions.
     // Each callback is registered on window under a generated name and the
@@ -164,7 +169,6 @@
     function pauseAndroidSync() {
         androidSyncCanStop = false;
         setAndroidSyncActive(false);
-        setProgressPulse(false);
         pausedSession = {
             profile: androidSyncProfile,
             direction: androidSyncDirection,
@@ -173,6 +177,8 @@
             errors: androidSyncErrors,
             current: androidSyncCurrent
         };
+        if (androidAutoSyncMode) return;
+        setProgressPulse(false);
         showProgressTab(true);
         renderPausedProgress();
         if (activeScreen === "home") applyHomeActions();
@@ -645,8 +651,19 @@
         }
     }
 
+    function autoSyncBusy() {
+        if (!isAndroid() || typeof window.AndroidBridge.isAutoSyncRunning !== "function") {
+            return false;
+        }
+        try {
+            return !!window.AndroidBridge.isAutoSyncRunning();
+        } catch (e) {
+            return false;
+        }
+    }
+
     function triggerSync(profileName, btn) {
-        if (androidSyncActive) {
+        if (androidSyncActive || autoSyncBusy()) {
             alert("A sync is already running.");
             return;
         }
@@ -688,24 +705,28 @@
         });
     }
 
-    function syncToDevice(profileName, btn) {
+    function syncToDevice(profileName, btn, onFinished) {
         var deviceId = window.AndroidBridge.getDeviceId() || null;
         if (!deviceId) {
             api("GET", "/web/device-id").then(function (data) {
                 deviceId = data.device_id;
                 window.AndroidBridge.saveDeviceId(deviceId);
-                doSyncToDevice(profileName, btn, deviceId);
+                doSyncToDevice(profileName, btn, deviceId, onFinished);
             }).catch(function (err) {
                 btn.disabled = false;
                 btn.textContent = "Sync Now";
+                if (androidAutoSyncMode) {
+                    if (onFinished) onFinished(false, 0, 0, 0);
+                    return;
+                }
                 alert(err.error || "Failed to get device ID");
             });
         } else {
-            doSyncToDevice(profileName, btn, deviceId);
+            doSyncToDevice(profileName, btn, deviceId, onFinished);
         }
     }
 
-    function doSyncToDevice(profileName, btn, deviceId) {
+    function doSyncToDevice(profileName, btn, deviceId, onFinished) {
         // Build a real destination manifest so the server computes a delta.
         // A missing folder or manifest failure falls back to an empty manifest
         // (full sync) rather than failing the whole sync.
@@ -718,11 +739,11 @@
                     manifest = { files: [] };
                 }
             }
-            startAndroidSync(profileName, btn, deviceId, manifest);
+            startAndroidSync(profileName, btn, deviceId, manifest, onFinished);
         }));
     }
 
-    function startAndroidSync(profileName, btn, deviceId, destManifest) {
+    function startAndroidSync(profileName, btn, deviceId, destManifest, onFinished) {
         var body = {
             device_id: deviceId,
             profile: profileName,
@@ -775,21 +796,27 @@
                 btn.disabled = false;
                 btn.textContent = "Sync Now";
                 finishAndroidSync(profileName, sessionPath, delta, 0, 0, 0, function (ok) {
+                    if (androidAutoSyncMode) {
+                        if (onFinished) onFinished(ok, 0, 0, 0);
+                        return;
+                    }
                     alert(ok ? "Already up to date" : "Could not apply deletions; a later sync will retry");
                 });
                 return;
             }
 
-            showProgressTab(true);
-            setProgressPulse(true);
             androidSyncStopRequested = false;
             androidSyncDirection = "pull";
             androidSyncCanStop = queue.length > 0;
             androidSyncCurrent = queue.length > 0 ? queue[0].path : "";
             setAndroidSyncActive(true);
             pausedSession = null;
-            navigate("progress");
-            updateSyncProgress(profileName, done, total, errors, androidSyncCurrent);
+            if (!androidAutoSyncMode) {
+                showProgressTab(true);
+                setProgressPulse(true);
+                navigate("progress");
+                updateSyncProgress(profileName, done, total, errors, androidSyncCurrent);
+            }
 
             var index = 0;
 
@@ -801,14 +828,20 @@
                 if (index >= queue.length) {
                     androidSyncCanStop = false;
                     androidSyncCurrent = "";
-                    updateSyncProgress(profileName, done, total, errors, "");
-                    finishAndroidSync(profileName, sessionPath, delta, done, total, errors);
+                    if (!androidAutoSyncMode) {
+                        updateSyncProgress(profileName, done, total, errors, "");
+                    }
+                    finishAndroidSync(profileName, sessionPath, delta, done, total, errors, function (ok) {
+                        if (onFinished) onFinished(ok, done, total, errors);
+                    });
                     return;
                 }
 
                 var f = queue[index++];
                 androidSyncCurrent = f.path;
-                updateSyncProgress(profileName, done, total, errors, f.path);
+                if (!androidAutoSyncMode) {
+                    updateSyncProgress(profileName, done, total, errors, f.path);
+                }
 
                 // A SHA256 on a pending file means the local copy is
                 // size+mtime-ambiguous: hash it and confirm if it already
@@ -860,12 +893,97 @@
             androidSyncCanStop = false;
             btn.disabled = false;
             btn.textContent = "Sync Now";
+            if (androidAutoSyncMode) {
+                if (onFinished) onFinished(false, 0, 0, 0);
+                return;
+            }
             if (activeScreen === "home") applyHomeActions();
             if (pausedSession && activeScreen === "progress") {
                 renderPausedProgress();
             }
             alert(err.error || "Failed to start sync");
         });
+    }
+
+    // --- Automatic sync (hidden WebView driven by AutoSyncService) ---
+
+    // Runs every server-eligible pull profile without touching the visible UI.
+    // The service triggers this by loading the page with ?autosync=1 and
+    // reports the final result through the Android bridge.
+    function runAutoSync() {
+        androidAutoSyncMode = true;
+        androidAutoSyncQueue = [];
+        androidAutoSyncIndex = 0;
+        androidAutoSyncFiles = 0;
+        androidAutoSyncErrors = 0;
+        androidSyncStopRequested = false;
+
+        api("GET", "/auto-sync").then(function (cfg) {
+            var profiles = (cfg && cfg.profiles) || [];
+            if (profiles.length === 0) {
+                notifyAutoSyncResult(true, "No auto-sync profiles");
+                return;
+            }
+
+            var destPath = "";
+            try {
+                destPath = window.AndroidBridge.getDestinationDisplayPath() || "";
+            } catch (e) {
+                destPath = "";
+            }
+            if (!destPath) {
+                notifyAutoSyncResult(false, "No sync folder selected");
+                return;
+            }
+
+            androidAutoSyncQueue = profiles;
+            runAutoSyncNext();
+        }).catch(function (err) {
+            notifyAutoSyncResult(false, (err && err.error) || "Failed to load auto-sync settings");
+        });
+    }
+
+    function runAutoSyncNext() {
+        if (androidAutoSyncIndex >= androidAutoSyncQueue.length) {
+            var summary = androidAutoSyncFiles + " file(s) synced";
+            if (androidAutoSyncErrors > 0) {
+                summary += ", " + androidAutoSyncErrors + " error(s)";
+            }
+            notifyAutoSyncResult(androidAutoSyncErrors === 0, summary);
+            return;
+        }
+
+        var profileName = androidAutoSyncQueue[androidAutoSyncIndex++];
+        androidSyncProfile = profileName;
+        androidSyncDirection = "pull";
+        androidSyncDone = 0;
+        androidSyncTotal = 0;
+        androidSyncErrors = 0;
+        androidSyncCurrent = "";
+        androidSyncCanStop = false;
+
+        // The pull path only needs a disabled/text pair; no real button exists
+        // in a headless page.
+        var btn = { disabled: false, textContent: "" };
+        syncToDevice(profileName, btn, function (ok, done, total, errors) {
+            androidAutoSyncFiles += done || 0;
+            androidAutoSyncErrors += errors || 0;
+            if (!ok && !errors) {
+                androidAutoSyncErrors++;
+            }
+            runAutoSyncNext();
+        });
+    }
+
+    function notifyAutoSyncResult(ok, message) {
+        androidAutoSyncMode = false;
+        if (isAndroid() && typeof window.AndroidBridge.autoSyncFinished === "function") {
+            try {
+                window.AndroidBridge.autoSyncFinished(!!ok, message || "");
+            } catch (e) {
+                // The service still retries on its next cycle.
+            }
+        }
     }
 
     // Confirms a size+mtime-ambiguous file without transferring it: hash the
@@ -1155,19 +1273,21 @@
             });
         }).then(function () {
             setAndroidSyncActive(false);
-            setProgressPulse(false);
             androidSyncCanStop = false;
             pausedSession = null;
-            progressCompleted = {
-                profile: androidSyncProfile,
-                direction: androidSyncDirection,
-                done: done,
-                total: total,
-                errors: errors
-            };
-            renderProgressView();
-            refreshProgressTab();
-            if (activeScreen === "home") applyHomeActions();
+            if (!androidAutoSyncMode) {
+                setProgressPulse(false);
+                progressCompleted = {
+                    profile: androidSyncProfile,
+                    direction: androidSyncDirection,
+                    done: done,
+                    total: total,
+                    errors: errors
+                };
+                renderProgressView();
+                refreshProgressTab();
+                if (activeScreen === "home") applyHomeActions();
+            }
             if (onDone) onDone(true);
         }).catch(function () {
             // The server kept the session: offer Resume instead of losing it.
@@ -1183,7 +1303,7 @@
     // --- Push (phone -> PC) ---
 
     function pushToDevice(profileName, btn) {
-        if (androidSyncActive) {
+        if (androidSyncActive || autoSyncBusy()) {
             alert("A sync is already running.");
             return;
         }
@@ -1702,71 +1822,11 @@
         el.innerHTML = '<h1>Settings</h1><div class="loading">Loading...</div>';
 
         api("GET", "/status").then(function (data) {
-            var html =
-                '<h1>Settings</h1>' +
-                '<div class="card">' +
-                '<div class="card-title">Server</div>' +
-                '<div class="setting-row"><span class="setting-label">Port</span><span class="setting-value">' + data.port + "</span></div>" +
-                '<div class="setting-row"><span class="setting-label">Paired devices</span><span class="setting-value">' + data.devices + "</span></div>" +
-                "</div>" +
-                '<div class="card">' +
-                '<div class="card-title">Sync</div>' +
-                '<div class="setting-row"><span class="setting-label">Auto-sync</span><div class="toggle" id="toggle-autosync"></div></div>' +
-                "</div>" +
-                '<div class="card">' +
-                '<div class="card-title">This Device</div>' +
-                '<div id="forget-server-block"></div>' +
-                "</div>";
-
-            el.innerHTML = html;
-
-            var toggle = document.getElementById("toggle-autosync");
-            if (toggle) {
-                toggle.addEventListener("click", function () {
-                    this.classList.toggle("on");
-                });
-            }
-
-            var forgetBlock = document.getElementById("forget-server-block");
-            if (forgetBlock) {
-                if (isAndroid()) {
-                    var destPath = window.AndroidBridge.getDestinationDisplayPath() || "";
-                    var destStatus = destPath
-                        ? '<p class="card-subtitle">Sync folder: <strong>' + esc(destPath) + '</strong></p>'
-                        : '<p class="card-subtitle" style="color:var(--status-warning)">No sync folder selected — tap Change to pick one</p>';
-                    forgetBlock.innerHTML =
-                        destStatus +
-                        '<div style="display:flex;gap:var(--space-2);margin:var(--space-2) 0">' +
-                        '<button class="btn btn-secondary btn-sm" id="btn-change-folder">Change folder</button>' +
-                        '<button class="btn btn-secondary btn-sm" id="btn-forget-server">Forget this server</button>' +
-                        "</div>";
-                    document.getElementById("btn-change-folder").addEventListener("click", function () {
-                        window.onDestinationPicked = function (result) {
-                            if (result.success) {
-                                var newPath = window.AndroidBridge.getDestinationDisplayPath();
-                                var sub = forgetBlock.querySelector(".card-subtitle");
-                                if (sub) {
-                                    sub.innerHTML = 'Sync folder: <strong>' + esc(newPath) + '</strong>';
-                                    sub.style.color = "";
-                                }
-                            }
-                        };
-                        window.AndroidBridge.pickDestinationFolder();
-                    });
-                    document.getElementById("btn-forget-server").addEventListener("click", function () {
-                        if (confirm("Forget this server and remove all stored data?")) {
-                            window.AndroidBridge.clearServerData();
-                        }
-                    });
-                } else {
-                    var destHtml = '<p class="card-subtitle">Destinations are configured in server config or via <code>presync connect</code>.</p>';
-                    forgetBlock.innerHTML =
-                        destHtml +
-                        '<div style="margin-top:var(--space-2)">' +
-                        '<p class="card-subtitle">To unpair, run <code>presync unpair</code> on the server.</p>' +
-                        "</div>";
-                }
-            }
+            return api("GET", "/auto-sync").catch(function () {
+                return null;
+            }).then(function (autoCfg) {
+                renderSettingsView(el, data, autoCfg);
+            });
         }).catch(function () {
             var serverUnreachable =
                 '<h1>Settings</h1>' +
@@ -1793,6 +1853,138 @@
                     }
                 });
             }
+        });
+    }
+
+    function renderSettingsView(el, data, autoCfg) {
+        var html =
+            '<h1>Settings</h1>' +
+            '<div class="card">' +
+            '<div class="card-title">Server</div>' +
+            '<div class="setting-row"><span class="setting-label">Port</span><span class="setting-value">' + data.port + "</span></div>" +
+            '<div class="setting-row"><span class="setting-label">Paired devices</span><span class="setting-value">' + data.devices + "</span></div>" +
+            "</div>" +
+            '<div class="card">' +
+            '<div class="card-title">Sync</div>' +
+            '<div class="setting-row"><span class="setting-label">Auto-sync</span><div class="toggle" id="toggle-autosync"></div></div>' +
+            '<p class="card-subtitle" id="autosync-caption" style="margin-top:var(--space-1)"></p>' +
+            "</div>" +
+            '<div class="card">' +
+            '<div class="card-title">This Device</div>' +
+            '<div id="forget-server-block"></div>' +
+            "</div>";
+
+        el.innerHTML = html;
+        bindAutoSyncToggle(autoCfg);
+
+        var forgetBlock = document.getElementById("forget-server-block");
+        if (forgetBlock) {
+            if (isAndroid()) {
+                var destPath = window.AndroidBridge.getDestinationDisplayPath() || "";
+                var destStatus = destPath
+                    ? '<p class="card-subtitle">Sync folder: <strong>' + esc(destPath) + '</strong></p>'
+                    : '<p class="card-subtitle" style="color:var(--status-warning)">No sync folder selected — tap Change to pick one</p>';
+                forgetBlock.innerHTML =
+                    destStatus +
+                    '<div style="display:flex;gap:var(--space-2);margin:var(--space-2) 0">' +
+                    '<button class="btn btn-secondary btn-sm" id="btn-change-folder">Change folder</button>' +
+                    '<button class="btn btn-secondary btn-sm" id="btn-forget-server">Forget this server</button>' +
+                    "</div>";
+                document.getElementById("btn-change-folder").addEventListener("click", function () {
+                    window.onDestinationPicked = function (result) {
+                        if (result.success) {
+                            var newPath = window.AndroidBridge.getDestinationDisplayPath();
+                            var sub = forgetBlock.querySelector(".card-subtitle");
+                            if (sub) {
+                                sub.innerHTML = 'Sync folder: <strong>' + esc(newPath) + '</strong>';
+                                sub.style.color = "";
+                            }
+                        }
+                    };
+                    window.AndroidBridge.pickDestinationFolder();
+                });
+                document.getElementById("btn-forget-server").addEventListener("click", function () {
+                    if (confirm("Forget this server and remove all stored data?")) {
+                        window.AndroidBridge.clearServerData();
+                    }
+                });
+            } else {
+                var destHtml = '<p class="card-subtitle">Destinations are configured in server config or via <code>presync connect</code>.</p>';
+                forgetBlock.innerHTML =
+                    destHtml +
+                    '<div style="margin-top:var(--space-2)">' +
+                    '<p class="card-subtitle">To unpair, run <code>presync unpair</code> on the server.</p>' +
+                    "</div>";
+            }
+        }
+    }
+
+    // The toggle is the device-local master switch. It only becomes active when
+    // the server has at least one eligible profile, the app supports
+    // auto-sync, and a sync folder exists.
+    function bindAutoSyncToggle(autoCfg) {
+        var toggle = document.getElementById("toggle-autosync");
+        var caption = document.getElementById("autosync-caption");
+        if (!toggle || !caption) return;
+
+        var eligible = (autoCfg && autoCfg.profiles) || [];
+        var serverAllows = eligible.length > 0;
+        var bridgeReady = isAndroid() && typeof window.AndroidBridge.getAutoSyncEnabled === "function";
+
+        var enabled = false;
+        if (bridgeReady) {
+            try {
+                enabled = !!window.AndroidBridge.getAutoSyncEnabled();
+            } catch (e) {
+                enabled = false;
+            }
+        }
+        if (enabled) {
+            toggle.classList.add("on");
+        }
+
+        var destPath = "";
+        if (isAndroid()) {
+            try {
+                destPath = window.AndroidBridge.getDestinationDisplayPath() || "";
+            } catch (e) {
+                destPath = "";
+            }
+        }
+
+        var reason = "";
+        if (!autoCfg) {
+            reason = "Auto-sync settings unavailable.";
+        } else if (!serverAllows) {
+            reason = "Disabled by the server — set auto_sync in config.toml.";
+        } else if (!isAndroid()) {
+            reason = "Managed by 'presync watch' on the client machine.";
+        } else if (!bridgeReady) {
+            reason = "Update the app to enable auto-sync.";
+        } else if (!destPath && !enabled) {
+            reason = "Pick a sync folder first.";
+        }
+
+        if (reason) {
+            caption.textContent = reason;
+        } else {
+            caption.textContent = "Profiles: " + eligible.join(", ");
+        }
+
+        if (reason) {
+            toggle.classList.add("disabled");
+            toggle.setAttribute("aria-disabled", "true");
+            return;
+        }
+
+        toggle.addEventListener("click", function () {
+            var next = !this.classList.contains("on");
+            try {
+                window.AndroidBridge.setAutoSyncEnabled(next);
+            } catch (e) {
+                return;
+            }
+            this.classList.toggle("on", next);
         });
     }
 
@@ -1966,6 +2158,10 @@
 
         if (storedToken) {
             token = storedToken;
+            if (getParam("autosync") === "1" && isAndroid()) {
+                runAutoSync();
+                return;
+            }
             window.addEventListener("hashchange", onHashChange);
             render(getHash());
             refreshProgressTab();
